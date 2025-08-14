@@ -1,237 +1,200 @@
-# main.py
 import os
 import uuid
-import json
 import hashlib
+import tempfile
+import subprocess
 from datetime import datetime
-from urllib.parse import unquote_plus
 
 import boto3
-import stripe
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from botocore.exceptions import ClientError
+import stripe
 
-# ================ ENV & FLASK ================
+# Load environment variables
 load_dotenv()
+
 app = Flask(__name__)
 
-AWS_REGION = os.getenv("AWS_REGION")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+# AWS clients
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION"),
+)
 
-STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
+rekognition_client = boto3.client(
+    "rekognition",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION"),
+)
 
+sns_client = boto3.client(
+    "sns",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION"),
+)
+
+# Stripe client
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+# Buckets
 BUCKETS = {
-    "videos": os.getenv("S3_BUCKET_VIDEOS"),
-    "promo": os.getenv("S3_BUCKET_PROMO"),
-    "advertising": os.getenv("S3_BUCKET_ADVERTISING"),
+    "user": os.getenv("S3_BUCKET_USER"),
+    "music": os.getenv("S3_BUCKET_MUSICIAN"),
+    "advertising": os.getenv("S3_BUCKET_ADVERTISER"),
 }
 
-DDB_TABLE = os.getenv("DYNAMODB_TABLE", "HipHopFeverFileHashes")
-SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
-NOTIFY_EMAIL = os.getenv("NOTIFICATION_EMAIL")  # admin notifications
+# Limits
+MAX_USER_DURATION_SECONDS = 3 * 60 + 30  # 3.5 minutes
+MAX_USER_FILE_SIZE_MB = 50
 
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mpeg", ".mpg"}
+# Temporary local storage for moderation
+TEMP_DIR = tempfile.gettempdir()
 
-# AWS clients
-common_kwargs = dict(region_name=AWS_REGION,
-                     aws_access_key_id=AWS_ACCESS_KEY_ID,
-                     aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
-s3 = boto3.client("s3", **common_kwargs)
-rekognition = boto3.client("rekognition", **common_kwargs)
-dynamodb = boto3.client("dynamodb", **common_kwargs)
-sns = boto3.client("sns", **common_kwargs)
+# Store uploaded file hashes to prevent duplicates (in-memory)
+uploaded_hashes = set()
 
-stripe.api_key = STRIPE_API_KEY
 
-# ================ UTILITIES ================
-def s3_upload_url(bucket, key, expires=3600):
-    return s3.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=expires,
-    )
-
-def s3_delete(bucket, key):
-    s3.delete_object(Bucket=bucket, Key=key)
-
-def s3_move(bucket, src_key, dst_key):
-    s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src_key}, Key=dst_key)
-    s3_delete(bucket, src_key)
-
-def s3_stream_md5(bucket, key):
-    h = hashlib.md5()
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    for chunk in obj["Body"].iter_chunks(chunk_size=1024 * 1024):
-        if chunk:
+def get_file_hash(file_path):
+    """Return SHA256 hash of a file."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
             h.update(chunk)
     return h.hexdigest()
 
-def ddb_is_duplicate(file_hash):
-    resp = dynamodb.get_item(TableName=DDB_TABLE, Key={"file_hash": {"S": file_hash}})
-    return "Item" in resp
 
-def ddb_record_hash(file_hash):
-    dynamodb.put_item(
-        TableName=DDB_TABLE,
-        Item={"file_hash": {"S": file_hash}, "created_at": {"S": datetime.utcnow().isoformat()}}
+def get_video_duration(file_path):
+    """Return video duration in seconds using ffprobe."""
+    cmd = f'ffprobe -i "{file_path}" -show_entries format=duration -v quiet -of csv="p=0"'
+    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr.decode()}")
+    return float(result.stdout)
+
+
+def moderate_file(bucket_name, key):
+    """Check file using AWS Rekognition moderation labels."""
+    response = rekognition_client.detect_moderation_labels(
+        Image={"S3Object": {"Bucket": bucket_name, "Name": key}},
+        MinConfidence=80,
     )
-
-def guess_is_video(content_type: str, key: str) -> bool:
-    ct = (content_type or "").lower()
-    if ct.startswith("video/"):
-        return True
-    for ext in VIDEO_EXTS:
-        if key.lower().endswith(ext):
-            return True
-    return False
-
-def rekogn_image_labels(bucket, key):
-    resp = rekognition.detect_moderation_labels(Image={"S3Object": {"Bucket": bucket, "Name": key}}, MinConfidence=80)
-    return resp.get("ModerationLabels", [])
-
-def rekogn_video_moderation(bucket, key, max_wait_seconds=300, poll_every=5):
-    start = rekognition.start_content_moderation(Video={"S3Object": {"Bucket": bucket, "Name": key}}, MinConfidence=80)
-    job_id = start["JobId"]
-    waited = 0
-    next_token = None
-    labels = []
-    while waited <= max_wait_seconds:
-        import time
-        time.sleep(poll_every)
-        waited += poll_every
-        kwargs = {"JobId": job_id, "SortBy": "TIMESTAMP"}
-        if next_token:
-            kwargs["NextToken"] = next_token
-        status = rekognition.get_content_moderation(**kwargs)
-        job_status = status.get("JobStatus")
-        if job_status == "SUCCEEDED":
-            mods = status.get("ModerationLabels", [])
-            labels.extend(mods)
-            next_token = status.get("NextToken")
-            if not next_token:
-                break
-        elif job_status in {"FAILED", "ERROR"}:
-            return [{"Name": f"Rekognition{job_status}", "Confidence": 100.0}]
+    labels = response.get("ModerationLabels", [])
     return labels
 
-def sns_notify(message):
-    if SNS_TOPIC_ARN:
-        sns.publish(TopicArn=SNS_TOPIC_ARN, Subject="HipHopFever Upload Accepted", Message=message)
 
-# ================ ENDPOINTS ================
-
-@app.route("/get-upload-url", methods=["POST"])
-def get_upload_url():
-    """
-    Client uploads file first, server runs moderation immediately.
-    If accepted → return Stripe Checkout Session URL for payment.
-    """
-    data = request.json
-    upload_type = data.get("upload_type")
-    file_name = data.get("file_name")
-    content_type = data.get("content_type")
-    price_id = data.get("price_id")  # Stripe Price ID for promo or advertising
-
-    if upload_type not in BUCKETS:
-        return jsonify({"error": "Invalid upload_type"}), 400
-
-    bucket = BUCKETS[upload_type]
-    key = f"pending/{uuid.uuid4()}_{file_name}"
-
-    # Generate S3 presigned URL for initial upload
-    presigned_url = s3_upload_url(bucket, key)
-
-    # Immediately run moderation after upload (simulate polling for uploaded object)
-    # For simplicity, we assume the client uploads the file instantly after receiving this URL
-    # In production, you may use S3 Event + Lambda or a small delay + polling
-    # Here, we just return presigned_url + key and require client to call /moderate endpoint
-    return jsonify({"upload_url": presigned_url, "s3_key": key})
-
-@app.route("/moderate", methods=["POST"])
-def moderate_and_checkout():
-    """
-    After the client uploads, they call this endpoint with s3_key.
-    Server performs moderation.
-    If passed → create Stripe Checkout Session.
-    """
-    data = request.json
-    upload_type = data.get("upload_type")
-    key = data.get("s3_key")
-    price_id = data.get("price_id")
-    file_name = data.get("file_name")
-    
-    if upload_type not in BUCKETS:
-        return jsonify({"error": "Invalid upload_type"}), 400
-    bucket = BUCKETS[upload_type]
-
-    # Compute MD5 hash
-    try:
-        file_hash = s3_stream_md5(bucket, key)
-    except ClientError:
-        return jsonify({"error": "Could not access uploaded file"}), 400
-
-    if ddb_is_duplicate(file_hash):
-        s3_delete(bucket, key)
-        return jsonify({"error": "Duplicate file"}), 400
-
-    # Detect if video or image
-    meta = s3.head_object(Bucket=bucket, Key=key)
-    content_type = meta.get("ContentType", "")
-    is_video = guess_is_video(content_type, key)
-
-    # Run moderation
-    if is_video:
-        labels = rekogn_video_moderation(bucket, key)
-    else:
-        labels = rekogn_image_labels(bucket, key)
-
-    if labels:
-        s3_delete(bucket, key)
-        return jsonify({"error": "Content rejected by moderation", "labels": labels}), 400
-
-    # Passed moderation → create Stripe Checkout Session
-    session = stripe.checkout.Session.create(
-        payment_method_types=['card'],
-        mode='payment',
-        line_items=[{"price": price_id, "quantity": 1}],
-        metadata={"s3_bucket": bucket, "s3_key": key, "upload_type": upload_type, "file_hash": file_hash},
-        success_url=f"https://yourfrontend.com/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"https://yourfrontend.com/cancel",
+def generate_presigned_url(bucket_name, key, content_type):
+    url = s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket_name, "Key": key, "ContentType": content_type},
+        ExpiresIn=3600,
     )
-    return jsonify({"checkout_url": session.url})
+    return url
 
-@app.route("/stripe-webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig_header = request.headers.get('Stripe-Signature')
-    event = None
-    try:
-        if STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        else:
-            event = json.loads(payload)
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        return '', 400
 
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        bucket = session['metadata']['s3_bucket']
-        key = session['metadata']['s3_key']
-        file_hash = session['metadata']['file_hash']
+def send_sns_email(subject, message):
+    """Send an SNS email notification."""
+    topic_arn = os.getenv("SNS_TOPIC_ARN")
+    if topic_arn:
+        sns_client.publish(TopicArn=topic_arn, Subject=subject, Message=message)
 
-        # Move to approved
-        approved_key = key.replace("pending/", "approved/")
-        s3_move(bucket, key, approved_key)
 
-        # Record hash to prevent duplicates
-        ddb_record_hash(file_hash)
+@app.route("/upload/<upload_type>", methods=["POST"])
+def upload_file(upload_type):
+    """Handle file upload, moderation, duplicate check, and Stripe session creation."""
+    if upload_type not in BUCKETS:
+        return jsonify({"error": "Invalid upload type"}), 400
 
-        # Notify admin
-        sns_notify(f"File approved & paid: s3://{bucket}/{approved_key}")
-    return '', 200
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    user_role = request.form.get("role", "user")
+    file = request.files["file"]
+    content_type = file.content_type
+    original_filename = file.filename
+    temp_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}_{original_filename}")
+    file.save(temp_path)
+
+    # Check duplicates
+    file_hash = get_file_hash(temp_path)
+    if file_hash in uploaded_hashes:
+        os.remove(temp_path)
+        return jsonify({"error": "Duplicate file detected"}), 400
+
+    # Check file size (for non-admin users)
+    if user_role != "admin":
+        size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        if size_mb > MAX_USER_FILE_SIZE_MB:
+            os.remove(temp_path)
+            return jsonify({"error": f"File too large. Max {MAX_USER_FILE_SIZE_MB} MB"}), 400
+
+        # Check duration
+        duration = get_video_duration(temp_path)
+        if duration > MAX_USER_DURATION_SECONDS:
+            os.remove(temp_path)
+            return jsonify({"error": f"Video too long. Max {MAX_USER_DURATION_SECONDS / 60:.1f} minutes"}), 400
+
+    # Upload to S3 pending folder
+    bucket_name = BUCKETS[upload_type]
+    s3_key = f"pending/{uuid.uuid4()}_{original_filename}"
+    s3_client.upload_file(temp_path, bucket_name, s3_key, ExtraArgs={"ContentType": content_type})
+
+    # Moderate file
+    labels = moderate_file(bucket_name, s3_key)
+    if labels:
+        s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+        os.remove(temp_path)
+        return jsonify({"error": "File rejected by moderation", "labels": labels}), 400
+
+    # Mark file hash as uploaded
+    uploaded_hashes.add(file_hash)
+
+    # Create Stripe session for paid uploads (only for music or advertising)
+    price_cents = 0
+    if upload_type in ["music", "advertising"]:
+        price_cents = int(request.form.get("price_cents", 500))  # default $5.00
+        try:
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                line_items=[{
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {"name": f"{upload_type} upload"},
+                        "unit_amount": price_cents,
+                    },
+                    "quantity": 1,
+                }],
+                mode="payment",
+                success_url=os.getenv("FRONTEND_SUCCESS_URL", "http://localhost:3000/success"),
+                cancel_url=os.getenv("FRONTEND_CANCEL_URL", "http://localhost:3000/cancel"),
+            )
+            stripe_url = session.url
+        except Exception as e:
+            return jsonify({"error": f"Stripe error: {str(e)}"}), 500
+    else:
+        stripe_url = None
+
+    # Move file to approved folder
+    approved_key = s3_key.replace("pending/", "approved/")
+    s3_client.copy_object(Bucket=bucket_name, CopySource={"Bucket": bucket_name, "Key": s3_key}, Key=approved_key)
+    s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+    os.remove(temp_path)
+
+    # Notify via SNS
+    send_sns_email(
+        subject="New Approved Upload",
+        message=f"{upload_type} upload approved: {approved_key}"
+    )
+
+    return jsonify({
+        "message": "Upload successful and approved",
+        "s3_key": approved_key,
+        "stripe_checkout_url": stripe_url,
+    })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

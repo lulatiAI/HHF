@@ -26,6 +26,13 @@ s3_client = boto3.client(
     region_name=aws_region
 )
 
+rekognition_client = boto3.client(
+    "rekognition",
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=aws_region
+)
+
 # -------------------------
 # Root Test Page
 # -------------------------
@@ -93,7 +100,7 @@ def test_payment():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 # -------------------------
-# Upload Video & Capture Payment
+# Video Upload, Moderation, & Payment
 # -------------------------
 @app.route("/upload-video", methods=["POST"])
 @swag_from({
@@ -132,15 +139,25 @@ def upload_video():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-    # 2️⃣ Run moderation (simulate acceptance)
-    accepted = True  # replace with AWS Rekognition moderation logic
+    # 2️⃣ AWS Rekognition Moderation
+    try:
+        response = rekognition_client.detect_moderation_labels(
+            Video={'S3Object': {'Bucket': s3_bucket_name, 'Name': filename}},
+            MinConfidence=80
+        )
+        labels = response.get('ModerationLabels', [])
+        if labels:
+            # Rejected
+            s3_client.delete_object(Bucket=s3_bucket_name, Key=filename)
+            return jsonify({
+                "status": "rejected",
+                "message": "Video rejected by moderation",
+                "labels": labels
+            }), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Moderation failed: {str(e)}"}), 500
 
-    if not accepted:
-        # Delete from S3 if rejected
-        s3_client.delete_object(Bucket=s3_bucket_name, Key=filename)
-        return jsonify({"status": "rejected", "message": "Video rejected by moderation"}), 400
-
-    # 3️⃣ Capture payment via Stripe
+    # 3️⃣ Stripe Payment Capture
     try:
         intent = stripe.PaymentIntent.create(
             amount=1000,  # $10 per video
@@ -150,7 +167,6 @@ def upload_video():
         )
         payment_status = intent.status
     except Exception as e:
-        # Delete video if payment fails
         s3_client.delete_object(Bucket=s3_bucket_name, Key=filename)
         return jsonify({"status": "error", "message": f"Payment failed: {str(e)}"}), 400
 

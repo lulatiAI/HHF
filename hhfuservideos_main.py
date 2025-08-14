@@ -1,13 +1,29 @@
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-from flasgger import Swagger, swag_from
 import os
 import stripe
 import boto3
+import ffmpeg
+from flasgger import Swagger, swag_from
 
 app = Flask(__name__)
 CORS(app)
-Swagger(app)
+
+# Initialize Flasgger Swagger UI
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": "apispec",
+            "route": "/apispec.json",
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
+        }
+    ],
+    "swagger_ui": True,
+    "specs_route": "/docs/"
+}
+swagger = Swagger(app, config=swagger_config)
 
 # -------------------------
 # Environment & API Setup
@@ -17,17 +33,9 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 aws_access_key = os.getenv("AWS_ACCESS_KEY")
 aws_secret_key = os.getenv("AWS_SECRET_KEY")
 aws_region = os.getenv("AWS_REGION", "us-east-1")
-s3_bucket_name = os.getenv("AWS_S3_BUCKET", "your-s3-bucket-name")
 
 s3_client = boto3.client(
     "s3",
-    aws_access_key_id=aws_access_key,
-    aws_secret_access_key=aws_secret_key,
-    region_name=aws_region
-)
-
-rekognition_client = boto3.client(
-    "rekognition",
     aws_access_key_id=aws_access_key,
     aws_secret_access_key=aws_secret_key,
     region_name=aws_region
@@ -68,6 +76,7 @@ def index():
                     });
             }
         </script>
+        <p>Swagger docs available at <a href="/docs/">/docs/</a></p>
     </body>
     </html>
     """
@@ -78,6 +87,22 @@ def index():
 # -------------------------
 @app.route("/test-video")
 def test_video():
+    """
+    Test video endpoint
+    ---
+    responses:
+      200:
+        description: Video endpoint reachable
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            message:
+              type: string
+            video_url:
+              type: string
+    """
     return jsonify({
         "status": "success",
         "message": "Video endpoint reachable!",
@@ -89,6 +114,20 @@ def test_video():
 # -------------------------
 @app.route("/test-payment")
 def test_payment():
+    """
+    Test Stripe payment endpoint
+    ---
+    responses:
+      200:
+        description: Stripe PaymentIntent created successfully
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            payment_intent:
+              type: object
+    """
     try:
         intent = stripe.PaymentIntent.create(
             amount=1000,  # $10
@@ -100,81 +139,51 @@ def test_payment():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 # -------------------------
-# Video Upload, Moderation, & Payment
+# Video Generation Endpoint
 # -------------------------
-@app.route("/upload-video", methods=["POST"])
-@swag_from({
-    'parameters': [
-        {
-            'name': 'file',
-            'in': 'formData',
-            'type': 'file',
-            'required': True,
-            'description': 'Video file to upload'
-        },
-        {
-            'name': 'stripe_payment_method_id',
-            'in': 'formData',
-            'type': 'string',
-            'required': True,
-            'description': 'Stripe Payment Method ID for paying users'
-        }
-    ],
-    'responses': {
-        200: {'description': 'Video accepted and payment processed'},
-        400: {'description': 'Video rejected or error'}
-    }
-})
-def upload_video():
-    if 'file' not in request.files:
-        return jsonify({"status": "error", "message": "No file provided"}), 400
-
-    file = request.files['file']
-    filename = file.filename
-    stripe_payment_method_id = request.form.get("stripe_payment_method_id")
-
-    # 1️⃣ Upload to S3
-    try:
-        s3_client.upload_fileobj(file, s3_bucket_name, filename)
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    # 2️⃣ AWS Rekognition Moderation
-    try:
-        response = rekognition_client.detect_moderation_labels(
-            Video={'S3Object': {'Bucket': s3_bucket_name, 'Name': filename}},
-            MinConfidence=80
-        )
-        labels = response.get('ModerationLabels', [])
-        if labels:
-            # Rejected
-            s3_client.delete_object(Bucket=s3_bucket_name, Key=filename)
-            return jsonify({
-                "status": "rejected",
-                "message": "Video rejected by moderation",
-                "labels": labels
-            }), 400
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Moderation failed: {str(e)}"}), 500
-
-    # 3️⃣ Stripe Payment Capture
-    try:
-        intent = stripe.PaymentIntent.create(
-            amount=1000,  # $10 per video
-            currency='usd',
-            payment_method=stripe_payment_method_id,
-            confirm=True
-        )
-        payment_status = intent.status
-    except Exception as e:
-        s3_client.delete_object(Bucket=s3_bucket_name, Key=filename)
-        return jsonify({"status": "error", "message": f"Payment failed: {str(e)}"}), 400
-
-    video_url = f"https://{s3_bucket_name}.s3.{aws_region}.amazonaws.com/{filename}"
+@app.route("/generate-video", methods=["POST"])
+def generate_video():
+    """
+    Generate video from image and prompt
+    ---
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - prompt_text
+            - prompt_image
+          properties:
+            prompt_text:
+              type: string
+            prompt_image:
+              type: string
+    responses:
+      200:
+        description: Video generated successfully
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            prompt_text:
+              type: string
+            prompt_image:
+              type: string
+            video_url:
+              type: string
+    """
+    data = request.get_json()
+    prompt_text = data.get("prompt_text")
+    prompt_image = data.get("prompt_image")
+    
+    # TODO: replace with real video generation logic using ffmpeg or AI
     return jsonify({
         "status": "success",
-        "video_url": video_url,
-        "payment_status": payment_status
+        "prompt_text": prompt_text,
+        "prompt_image": prompt_image,
+        "video_url": "https://example.com/generated_video.mp4"
     })
 
 # -------------------------

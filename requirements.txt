@@ -1,5 +1,5 @@
 Flask==2.3.3
 boto3==1.28.45
 python-dotenv==1.0.0
-stripe==6.14.0
+stripe==12.4.0
 ffmpeg-python==0.2.0

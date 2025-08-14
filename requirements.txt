@@ -3,3 +3,4 @@ boto3==1.28.45
 python-dotenv==1.0.0
 stripe==12.4.0
 ffmpeg-python==0.2.0
+gunicorn==21.2.0

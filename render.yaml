@@ -2,7 +2,33 @@ services:
   - type: web
     name: hhf
     env: python
+    plan: free
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
       pip install -r requirements.txt
     startCommand: python app.py
+    envVars:
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        sync: false
+      - key: FRONTEND_CANCEL_URL
+        sync: false
+      - key: FRONTEND_SUCCESS_URL
+        sync: false
+      - key: NOTIFICATION_EMAIL
+        sync: false
+      - key: PORT
+        sync: false
+      - key: S3_BUCKET_ADVERTISING
+        sync: false
+      - key: S3_BUCKET_MUSIC_PROMO
+        sync: false
+      - key: S3_BUCKET_USER_VIDEOS
+        sync: false
+      - key: SNS_TOPIC_ARN
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false

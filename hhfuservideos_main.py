@@ -3,7 +3,9 @@ from flask_cors import CORS
 import os
 import stripe
 import boto3
-import ffmpeg
+from botocore.exceptions import ClientError
+import uuid
+
 from flasgger import Swagger, swag_from
 
 app = Flask(__name__)
@@ -15,15 +17,23 @@ Swagger(app)
 # -------------------------
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-aws_access_key = os.getenv("AWS_ACCESS_KEY")
-aws_secret_key = os.getenv("AWS_SECRET_KEY")
-aws_region = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 
 s3_client = boto3.client(
     "s3",
-    aws_access_key_id=aws_access_key,
-    aws_secret_access_key=aws_secret_key,
-    region_name=aws_region
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
+)
+
+rekognition_client = boto3.client(
+    "rekognition",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
 )
 
 # -------------------------
@@ -70,41 +80,16 @@ def index():
 # Test Video Endpoint
 # -------------------------
 @app.route("/test-video")
-@swag_from({
-    "responses": {
-        200: {
-            "description": "Video endpoint reachable",
-            "examples": {
-                "application/json": {
-                    "status": "success",
-                    "message": "Video endpoint reachable!",
-                    "video_url": "https://example.com/test_video.mp4"
-                }
-            }
-        }
-    }
-})
 def test_video():
     return jsonify({
         "status": "success",
-        "message": "Video endpoint reachable!",
-        "video_url": "https://example.com/test_video.mp4"
+        "message": "Video endpoint reachable!"
     })
 
 # -------------------------
 # Test Stripe Payment Endpoint
 # -------------------------
 @app.route("/test-payment")
-@swag_from({
-    "responses": {
-        200: {
-            "description": "Stripe PaymentIntent created",
-        },
-        400: {
-            "description": "Stripe error",
-        }
-    }
-})
 def test_payment():
     try:
         intent = stripe.PaymentIntent.create(
@@ -117,50 +102,99 @@ def test_payment():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 # -------------------------
-# Video Generation Endpoint
+# Upload & Verify Video Endpoint
 # -------------------------
-@app.route("/generate-video", methods=["POST"])
-@swag_from({
-    "parameters": [
-        {
-            "name": "body",
-            "in": "body",
-            "required": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "prompt_text": {"type": "string"},
-                    "prompt_image": {"type": "string"}
-                },
-                "required": ["prompt_text", "prompt_image"]
-            }
-        }
-    ],
-    "responses": {
-        200: {
-            "description": "Generated video",
-            "examples": {
-                "application/json": {
-                    "status": "success",
-                    "prompt_text": "Sample text",
-                    "prompt_image": "https://example.com/sample.png",
-                    "video_url": "https://example.com/generated_video.mp4"
-                }
-            }
-        }
-    }
-})
-def generate_video():
-    data = request.get_json()
-    prompt_text = data.get("prompt_text")
-    prompt_image = data.get("prompt_image")
-    
-    # TODO: integrate your AWS S3 + video processing logic
+@app.route("/upload-video", methods=["POST"])
+def upload_video():
+    """
+    Upload a video to S3, verify with AWS Rekognition,
+    and handle approval/rejection automatically.
+    ---
+    consumes:
+      - multipart/form-data
+    parameters:
+      - name: file
+        in: formData
+        type: file
+        required: true
+        description: Video file to upload
+      - name: user_id
+        in: formData
+        type: string
+        required: true
+        description: ID of the uploading user
+      - name: paid
+        in: formData
+        type: boolean
+        required: false
+        description: Is this a paying user? Default false
+    responses:
+      200:
+        description: Video uploaded and processed
+      400:
+        description: Error occurred
+    """
+    file = request.files.get("file")
+    user_id = request.form.get("user_id")
+    paid = request.form.get("paid", "false").lower() == "true"
+
+    if not file or not user_id:
+        return jsonify({"status": "error", "message": "Missing file or user_id"}), 400
+
+    # Generate unique filename
+    file_ext = os.path.splitext(file.filename)[1]
+    file_key = f"videos/{user_id}/{uuid.uuid4()}{file_ext}"
+
+    # Upload to S3 temporarily
+    try:
+        s3_client.upload_fileobj(file, S3_BUCKET, file_key)
+    except ClientError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    # Rekognition moderation check
+    try:
+        response = rekognition_client.detect_moderation_labels(
+            Video={
+                "S3Object": {"Bucket": S3_BUCKET, "Name": file_key}
+            },
+            MinConfidence=70
+        )
+        labels = response.get("ModerationLabels", [])
+    except ClientError as e:
+        # Delete temp file if Rekognition fails
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=file_key)
+        return jsonify({"status": "error", "message": "Rekognition failed: " + str(e)}), 500
+
+    # If any unsafe content is detected, reject
+    if labels:
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=file_key)
+        return jsonify({
+            "status": "rejected",
+            "message": "Video rejected due to inappropriate content",
+            "labels": labels
+        })
+
+    # Video accepted
+    video_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{file_key}"
+
+    # Optionally handle Stripe payment if paid user
+    payment_intent = None
+    if paid:
+        try:
+            payment_intent = stripe.PaymentIntent.create(
+                amount=1000,  # Example $10 payment
+                currency='usd',
+                payment_method_types=['card'],
+                metadata={"user_id": user_id, "video_key": file_key}
+            )
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Stripe payment failed: {str(e)}"}), 500
+
+    # Return success
     return jsonify({
-        "status": "success",
-        "prompt_text": prompt_text,
-        "prompt_image": prompt_image,
-        "video_url": prompt_image  # For testing, returns the same video/image URL
+        "status": "accepted",
+        "video_url": video_url,
+        "payment_intent": payment_intent
     })
 
 # -------------------------

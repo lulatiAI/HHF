@@ -7,6 +7,7 @@ from datetime import datetime
 
 import boto3
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from dotenv import load_dotenv
 import stripe
 
@@ -14,6 +15,7 @@ import stripe
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # AWS clients
 s3_client = boto3.client(
@@ -193,6 +195,12 @@ def upload_file(upload_type):
         "s3_key": approved_key,
         "stripe_checkout_url": stripe_url,
     })
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Simple endpoint to test if the API is live."""
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":

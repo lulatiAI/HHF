@@ -32,4 +32,3 @@ services:
         sync: false
       - key: STRIPE_SECRET_KEY
         sync: false
-

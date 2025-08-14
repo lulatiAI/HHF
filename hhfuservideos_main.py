@@ -1,73 +1,115 @@
-# hhfuservideos_main.py
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import os
-import boto3
 import stripe
+import boto3
 import ffmpeg
-from dotenv import load_dotenv
 
-# Load environment variables from .env
-load_dotenv()
-
-# Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# Stripe API key
-stripe.api_key = os.getenv("STRIPE_API_KEY")
+# -------------------------
+# Environment & API Setup
+# -------------------------
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-# AWS S3 setup
-s3 = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    region_name=os.getenv("AWS_REGION")
+aws_access_key = os.getenv("AWS_ACCESS_KEY")
+aws_secret_key = os.getenv("AWS_SECRET_KEY")
+aws_region = os.getenv("AWS_REGION", "us-east-1")
+
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=aws_region
 )
 
-# Safe root route
+# -------------------------
+# Root Test Page
+# -------------------------
 @app.route("/")
-def root():
-    return "Test environment — nothing to see here.", 200
+def index():
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>HHF Test Page</title>
+    </head>
+    <body>
+        <h2>HHF Backend Test Page</h2>
+        <p>Use these buttons to test endpoints:</p>
+        <button onclick="testVideo()">Test Video Endpoint</button>
+        <button onclick="testPayment()">Test Stripe Payment</button>
+        <pre id="output"></pre>
+        
+        <script>
+            function testVideo() {
+                fetch('/test-video')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('output').innerText = JSON.stringify(data, null, 2);
+                    });
+            }
+            function testPayment() {
+                fetch('/test-payment')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('output').innerText = JSON.stringify(data, null, 2);
+                    });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
-# Example API route: video generation
+# -------------------------
+# Test Video Endpoint
+# -------------------------
+@app.route("/test-video")
+def test_video():
+    return jsonify({
+        "status": "success",
+        "message": "Video generation endpoint reachable!",
+        "video_url": "https://example.com/test_video.mp4"
+    })
+
+# -------------------------
+# Test Stripe Payment Endpoint
+# -------------------------
+@app.route("/test-payment")
+def test_payment():
+    try:
+        intent = stripe.PaymentIntent.create(
+            amount=1000,  # $10
+            currency='usd',
+            payment_method_types=['card']
+        )
+        return jsonify({"status": "success", "payment_intent": intent})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+# -------------------------
+# Video Generation Endpoint
+# -------------------------
 @app.route("/generate-video", methods=["POST"])
 def generate_video():
-    try:
-        data = request.get_json()
-        prompt_text = data.get("prompt_text")
-        prompt_image = data.get("prompt_image")
+    data = request.get_json()
+    prompt_text = data.get("prompt_text")
+    prompt_image = data.get("prompt_image")
+    
+    # TODO: replace this with actual ffmpeg/video logic
+    return jsonify({
+        "status": "success",
+        "prompt_text": prompt_text,
+        "prompt_image": prompt_image,
+        "video_url": "https://example.com/generated_video.mp4"
+    })
 
-        # Your video generation logic goes here
-        output_filename = "output.mp4"
-        # Example placeholder: ffmpeg.input(prompt_image).output(output_filename).run()
-
-        return jsonify({"video_url": f"https://example.com/{output_filename}"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# Example API route: Stripe payment intent
-@app.route("/create-payment-intent", methods=["POST"])
-def create_payment_intent():
-    try:
-        data = request.get_json()
-        amount = data.get("amount")
-
-        intent = stripe.PaymentIntent.create(
-            amount=amount,
-            currency="usd",
-        )
-
-        return jsonify({"client_secret": intent.client_secret}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# Catch-all route for any other URL
-@app.errorhandler(404)
-def page_not_found(e):
-    return "Nothing to see here — invalid URL.", 404
-
-# Run app (for local testing)
+# -------------------------
+# Run App
+# -------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

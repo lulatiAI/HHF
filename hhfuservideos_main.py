@@ -4,12 +4,12 @@ import os
 import stripe
 import boto3
 import ffmpeg
-from flasgger import Swagger, swag_from
+from flasgger import Swagger
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize Flasgger Swagger UI
+# Initialize Swagger
 swagger_config = {
     "headers": [],
     "specs": [
@@ -42,7 +42,7 @@ s3_client = boto3.client(
 )
 
 # -------------------------
-# Root Test Page
+# Root Page with Video Preview
 # -------------------------
 @app.route("/")
 def index():
@@ -51,31 +51,49 @@ def index():
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>HHF Test Page</title>
+        <title>HHF Video Generator</title>
     </head>
     <body>
-        <h2>HHF Backend Test Page</h2>
-        <p>Use these buttons to test endpoints:</p>
-        <button onclick="testVideo()">Test Video Endpoint</button>
-        <button onclick="testPayment()">Test Stripe Payment</button>
+        <h2>HHF Video Generator</h2>
+
+        <label>Prompt Text:</label>
+        <input type="text" id="prompt_text" value="A cat riding a skateboard"><br><br>
+
+        <label>Image URL:</label>
+        <input type="text" id="prompt_image" value="https://example.com/cat.png"><br><br>
+
+        <button onclick="generateVideo()">Generate Video</button><br><br>
+
+        <video id="video_player" width="480" height="270" controls autoplay>
+            <source id="video_source" src="" type="video/mp4">
+            Your browser does not support the video tag.
+        </video>
+
         <pre id="output"></pre>
-        
+
         <script>
-            function testVideo() {
-                fetch('/test-video')
-                    .then(response => response.json())
-                    .then(data => {
-                        document.getElementById('output').innerText = JSON.stringify(data, null, 2);
-                    });
-            }
-            function testPayment() {
-                fetch('/test-payment')
-                    .then(response => response.json())
-                    .then(data => {
-                        document.getElementById('output').innerText = JSON.stringify(data, null, 2);
-                    });
+            async function generateVideo() {
+                const prompt_text = document.getElementById('prompt_text').value;
+                const prompt_image = document.getElementById('prompt_image').value;
+
+                const response = await fetch('/generate-video', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({prompt_text, prompt_image})
+                });
+
+                const data = await response.json();
+                document.getElementById('output').innerText = JSON.stringify(data, null, 2);
+
+                if (data.status === 'success') {
+                    const video_url = data.video_url;
+                    const videoSource = document.getElementById('video_source');
+                    videoSource.src = video_url;
+                    document.getElementById('video_player').load();
+                }
             }
         </script>
+
         <p>Swagger docs available at <a href="/docs/">/docs/</a></p>
     </body>
     </html>
@@ -87,22 +105,6 @@ def index():
 # -------------------------
 @app.route("/test-video")
 def test_video():
-    """
-    Test video endpoint
-    ---
-    responses:
-      200:
-        description: Video endpoint reachable
-        schema:
-          type: object
-          properties:
-            status:
-              type: string
-            message:
-              type: string
-            video_url:
-              type: string
-    """
     return jsonify({
         "status": "success",
         "message": "Video endpoint reachable!",
@@ -114,20 +116,6 @@ def test_video():
 # -------------------------
 @app.route("/test-payment")
 def test_payment():
-    """
-    Test Stripe payment endpoint
-    ---
-    responses:
-      200:
-        description: Stripe PaymentIntent created successfully
-        schema:
-          type: object
-          properties:
-            status:
-              type: string
-            payment_intent:
-              type: object
-    """
     try:
         intent = stripe.PaymentIntent.create(
             amount=1000,  # $10
@@ -143,47 +131,19 @@ def test_payment():
 # -------------------------
 @app.route("/generate-video", methods=["POST"])
 def generate_video():
-    """
-    Generate video from image and prompt
-    ---
-    parameters:
-      - in: body
-        name: body
-        schema:
-          type: object
-          required:
-            - prompt_text
-            - prompt_image
-          properties:
-            prompt_text:
-              type: string
-            prompt_image:
-              type: string
-    responses:
-      200:
-        description: Video generated successfully
-        schema:
-          type: object
-          properties:
-            status:
-              type: string
-            prompt_text:
-              type: string
-            prompt_image:
-              type: string
-            video_url:
-              type: string
-    """
     data = request.get_json()
     prompt_text = data.get("prompt_text")
     prompt_image = data.get("prompt_image")
-    
-    # TODO: replace with real video generation logic using ffmpeg or AI
+
+    # TODO: replace with real AI video generation logic
+    # For now, return a dummy video URL for testing
+    video_url = "https://example.com/generated_video.mp4"
+
     return jsonify({
         "status": "success",
         "prompt_text": prompt_text,
         "prompt_image": prompt_image,
-        "video_url": "https://example.com/generated_video.mp4"
+        "video_url": video_url
     })
 
 # -------------------------

@@ -40,11 +40,11 @@ sns_client = boto3.client(
 # Stripe client
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-# Buckets
+# Buckets (matching your Render env vars)
 BUCKETS = {
-    "user": os.getenv("S3_BUCKET_USER"),
-    "music": os.getenv("S3_BUCKET_MUSICIAN"),
-    "advertising": os.getenv("S3_BUCKET_ADVERTISER"),
+    "user": os.getenv("S3_BUCKET_USER_VIDEOS"),
+    "music": os.getenv("S3_BUCKET_MUSIC_PROMO"),
+    "advertising": os.getenv("S3_BUCKET_ADVERTISING"),
 }
 
 # Limits
@@ -154,6 +154,7 @@ def upload_file(upload_type):
 
     # Create Stripe session for paid uploads (only for music or advertising)
     price_cents = 0
+    stripe_url = None
     if upload_type in ["music", "advertising"]:
         price_cents = int(request.form.get("price_cents", 500))  # default $5.00
         try:
@@ -174,8 +175,6 @@ def upload_file(upload_type):
             stripe_url = session.url
         except Exception as e:
             return jsonify({"error": f"Stripe error: {str(e)}"}), 500
-    else:
-        stripe_url = None
 
     # Move file to approved folder
     approved_key = s3_key.replace("pending/", "approved/")

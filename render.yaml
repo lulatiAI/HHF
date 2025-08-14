@@ -6,7 +6,7 @@ services:
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
       pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: python hhfuservideos_main.py
     envVars:
       - key: AWS_ACCESS_KEY_ID
         sync: false

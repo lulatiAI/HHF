@@ -5,13 +5,15 @@ import boto3
 import uuid
 import threading
 import subprocess
-from botocore.exceptions import ClientError
 import time
+from botocore.exceptions import ClientError
 
 app = Flask(__name__)
 CORS(app)
 
+# -------------------------
 # AWS setup
+# -------------------------
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -74,15 +76,21 @@ def send_email_notification(subject, body):
         print("SES email error:", e)
 
 def moderate_video_async(temp_key, filename, metadata):
-    """
-    Strict moderation: reject any video flagged by Rekognition or failing duration check.
-    Approved videos go to permanent bucket, you are notified via email.
-    """
+    """Moderate and move approved videos asynchronously."""
     try:
+        # Download temporarily to check duration
+        tmp_file = f"/tmp/{uuid.uuid4()}_{filename}"
+        s3_client.download_file(TEMP_BUCKET, temp_key, tmp_file)
+        duration = get_video_duration(tmp_file)
+        if duration is None or duration < 15 or duration > 210:
+            print(f"Video '{filename}' rejected due to duration: {duration}")
+            s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+            return
+
         # Start Rekognition moderation
         response = rekognition.start_content_moderation(
             Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
-            MinConfidence=90  # stricter threshold
+            MinConfidence=90
         )
         job_id = response["JobId"]
 
@@ -118,6 +126,12 @@ def moderate_video_async(temp_key, filename, metadata):
                 "New Video Uploaded",
                 f"Video '{filename}' has been approved and is available at {video_url}"
             )
+    except Exception as e:
+        print("Moderation error:", e)
+        try:
+            s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+        except:
+            pass
 
 # -------------------------
 # Pre-signed URL Endpoint
@@ -152,7 +166,7 @@ def get_upload_url():
             ExpiresIn=3600
         )
 
-        # Moderate video asynchronously after upload
+        # Start moderation asynchronously
         threading.Thread(target=moderate_video_async, args=(temp_key, filename, {
             "email": email,
             "videoType": video_type,

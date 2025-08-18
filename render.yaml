@@ -16,10 +16,6 @@ services:
         sync: false
       - key: AWS_REGION
         sync: false
-      - key: FRONTEND_CANCEL_URL
-        sync: false
-      - key: FRONTEND_SUCCESS_URL
-        sync: false
       - key: NOTIFICATION_EMAIL
         sync: false
       - key: PORT
@@ -31,6 +27,4 @@ services:
       - key: S3_BUCKET_USER_VIDEOS
         sync: false
       - key: SNS_TOPIC_ARN
-        sync: false
-      - key: STRIPE_SECRET_KEY
         sync: false

@@ -8,10 +8,33 @@ import threading
 import subprocess
 import time
 from botocore.exceptions import ClientError
+import importlib  # Fix for Python 3.13 (imp replacement)
 
 app = Flask(__name__)
 CORS(app)
-Swagger(app)
+
+# Swagger configuration for Python 3.13 compatibility
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": 'apispec_1',
+            "route": '/apispec_1.json',
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
+        }
+    ],
+    "swagger_ui": True,
+    "specs_route": "/docs/"
+}
+swagger_template = {
+    "info": {
+        "title": "HHF User Videos API",
+        "version": "1.0",
+        "description": "API for uploading and moderating user videos",
+    }
+}
+Swagger(app, config=swagger_config, template=swagger_template)
 
 # -------------------------
 # AWS setup
@@ -80,7 +103,6 @@ def send_email_notification(subject, body):
 def moderate_video(temp_key, filename, metadata):
     """Moderate and move approved videos after upload confirmation."""
     try:
-        # Download temporarily to check duration
         tmp_file = f"/tmp/{uuid.uuid4()}_{filename}"
         s3_client.download_file(TEMP_BUCKET, temp_key, tmp_file)
         duration = get_video_duration(tmp_file)
@@ -90,14 +112,12 @@ def moderate_video(temp_key, filename, metadata):
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             return
 
-        # Start Rekognition moderation
         response = rekognition.start_content_moderation(
             Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
             MinConfidence=90
         )
         job_id = response["JobId"]
 
-        # Poll until Rekognition finishes
         while True:
             result = rekognition.get_content_moderation(JobId=job_id)
             status = result.get("JobStatus")
@@ -110,7 +130,6 @@ def moderate_video(temp_key, filename, metadata):
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             print(f"Video '{filename}' rejected by Rekognition.")
         else:
-            # Approved: move to permanent bucket
             perm_key = f"{uuid.uuid4()}_{filename}"
             copy_source = {"Bucket": TEMP_BUCKET, "Key": temp_key}
             s3_client.copy_object(
@@ -140,38 +159,6 @@ def moderate_video(temp_key, filename, metadata):
 # -------------------------
 @app.route("/get-upload-url", methods=["POST"])
 def get_upload_url():
-    """
-    Get a presigned S3 URL to upload a video
-    ---
-    parameters:
-      - in: body
-        name: body
-        schema:
-          type: object
-          required:
-            - email
-            - videoType
-            - consent
-            - filename
-          properties:
-            email:
-              type: string
-            videoType:
-              type: string
-            comments:
-              type: string
-            consent:
-              type: boolean
-            filename:
-              type: string
-    responses:
-      200:
-        description: URL generated successfully
-      400:
-        description: Missing required fields
-      500:
-        description: Server error
-    """
     data = request.get_json()
     email = data.get("email", "").strip()
     video_type = data.get("videoType", "").strip()
@@ -199,10 +186,7 @@ def get_upload_url():
             },
             ExpiresIn=3600
         )
-
-        # Return URL and temp_key to client
         return jsonify({"status": "success", "upload_url": presigned_url, "temp_key": temp_key})
-
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -211,38 +195,6 @@ def get_upload_url():
 # -------------------------
 @app.route("/confirm-upload", methods=["POST"])
 def confirm_upload():
-    """
-    Confirm that the client finished uploading, then start moderation
-    ---
-    parameters:
-      - in: body
-        name: body
-        schema:
-          type: object
-          required:
-            - temp_key
-            - filename
-            - email
-            - videoType
-          properties:
-            temp_key:
-              type: string
-            filename:
-              type: string
-            email:
-              type: string
-            videoType:
-              type: string
-            comments:
-              type: string
-    responses:
-      200:
-        description: Moderation started
-      400:
-        description: Missing required fields
-      500:
-        description: Server error
-    """
     data = request.get_json()
     temp_key = data.get("temp_key")
     filename = data.get("filename")
@@ -254,8 +206,6 @@ def confirm_upload():
         return jsonify({"status": "error", "message": "Missing required fields"}), 400
 
     metadata = {"email": email, "videoType": video_type, "comments": comments}
-
-    # Start moderation in a separate thread
     threading.Thread(target=moderate_video, args=(temp_key, filename, metadata)).start()
 
     return jsonify({"status": "success", "message": "Moderation started"})

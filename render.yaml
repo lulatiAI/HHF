@@ -3,10 +3,12 @@ services:
     name: hhf
     env: python
     plan: free
+    pythonVersion: "3.12.15"   # Downgrade to Python 3.12
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
+      pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: python hhfuservideos_main.py
+    startCommand: gunicorn hhfuservideos_main:app --bind 0.0.0.0:$PORT
     envVars:
       - key: AWS_ACCESS_KEY_ID
         sync: false

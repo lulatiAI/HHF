@@ -6,6 +6,7 @@ import uuid
 import tempfile
 import subprocess
 from botocore.exceptions import ClientError
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -47,7 +48,7 @@ NOTIFY_EMAIL = "Antoinemaxwell0@gmail.com"
 # Helpers
 # -------------------------
 def get_video_duration(file_path):
-    """Return video duration in seconds using ffmpeg."""
+    """Return video duration in seconds using ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
@@ -79,32 +80,49 @@ def send_email_notification(subject, body):
 # -------------------------
 @app.route("/upload-video", methods=["POST"])
 def upload_video():
-    if "video" not in request.files:
-        return jsonify({"status": "error", "message": "No video file provided"}), 400
-
-    file = request.files["video"]
-    filename = file.filename
-    ext = filename.split('.')[-1].lower()
-    if ext not in ["mp4", "mov", "avi", "mkv"]:
-        return jsonify({"status": "error", "message": "Unsupported video format"}), 400
-
-    # Save video temporarily
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
-    file.save(tmp_file.name)
-
-    # Check duration
-    duration = get_video_duration(tmp_file.name)
-    if duration is None:
-        return jsonify({"status": "error", "message": "Could not determine video duration"}), 400
-    if duration < 15 or duration > 210:  # 3:30 = 210 sec
-        return jsonify({"status": "error", "message": "Video must be between 15s and 3:30s"}), 400
-
-    # Upload to temp S3 bucket
-    temp_key = f"{uuid.uuid4()}.{ext}"
-    s3_client.upload_file(tmp_file.name, TEMP_BUCKET, temp_key, ExtraArgs={"ACL": "private"})
-
-    # Start Rekognition moderation
+    tmp_file = None
     try:
+        # Validate required fields
+        email = request.form.get("email", "").strip()
+        video_type = request.form.get("videoType", "").strip()
+        comments = request.form.get("comments", "").strip()
+        consent = request.form.get("consent", "true").lower() == "true"  # frontend ensures checkbox
+
+        if not email or not video_type or not consent:
+            return jsonify({"status": "error", "message": "Email, video type, and consent are required"}), 400
+
+        if "video" not in request.files:
+            return jsonify({"status": "error", "message": "No video file provided"}), 400
+
+        file = request.files["video"]
+        filename = file.filename
+        ext = filename.split('.')[-1].lower()
+        if ext not in ["mp4", "mov", "avi", "mkv"]:
+            return jsonify({"status": "error", "message": "Unsupported video format"}), 400
+
+        # Save video temporarily
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+        file.save(tmp_file.name)
+
+        # Check duration
+        duration = get_video_duration(tmp_file.name)
+        if duration is None:
+            return jsonify({"status": "error", "message": "Could not determine video duration"}), 400
+        if duration < 15 or duration > 210:
+            return jsonify({"status": "error", "message": "Video must be between 15s and 3:30s"}), 400
+
+        # Upload to temp S3 bucket
+        temp_key = f"{uuid.uuid4()}.{ext}"
+        s3_client.upload_file(
+            tmp_file.name, TEMP_BUCKET, temp_key,
+            ExtraArgs={"ACL": "private", "Metadata": {
+                "email": email,
+                "videoType": video_type,
+                "comments": comments
+            }}
+        )
+
+        # Start Rekognition moderation
         response = rekognition.start_content_moderation(
             Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
             MinConfidence=80
@@ -117,7 +135,6 @@ def upload_video():
             status = result.get("JobStatus")
             if status in ["SUCCEEDED", "FAILED"]:
                 break
-            import time
             time.sleep(5)
 
         if status == "FAILED":
@@ -126,7 +143,7 @@ def upload_video():
 
         moderation_labels = result.get("ModerationLabels", [])
         if moderation_labels:
-            # Rejected
+            # Rejected by Rekognition
             send_email_notification(
                 "Video Rejected",
                 f"Your uploaded video '{filename}' was rejected by Rekognition: {moderation_labels}"
@@ -137,7 +154,14 @@ def upload_video():
         # Approved: Move video to permanent bucket
         perm_key = f"{uuid.uuid4()}.{ext}"
         copy_source = {"Bucket": TEMP_BUCKET, "Key": temp_key}
-        s3_client.copy_object(Bucket=PERM_BUCKET, Key=perm_key, CopySource=copy_source, ACL="public-read")
+        s3_client.copy_object(
+            Bucket=PERM_BUCKET,
+            Key=perm_key,
+            CopySource=copy_source,
+            ACL="public-read",
+            Metadata={"email": email, "videoType": video_type, "comments": comments},
+            MetadataDirective="REPLACE"
+        )
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
 
         video_url = f"https://{PERM_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{perm_key}"
@@ -146,6 +170,14 @@ def upload_video():
     except Exception as e:
         print("Error:", e)
         return jsonify({"status": "error", "message": str(e)}), 500
+
+    finally:
+        # Cleanup temp file
+        if tmp_file:
+            try:
+                os.unlink(tmp_file.name)
+            except Exception as e:
+                print("Temp file cleanup error:", e)
 
 # -------------------------
 # Run App

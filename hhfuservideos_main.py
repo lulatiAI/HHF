@@ -1,150 +1,151 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-import stripe
 import boto3
-import ffmpeg
-from flasgger import Swagger
+import uuid
+import tempfile
+import subprocess
+from botocore.exceptions import ClientError
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize Swagger
-swagger_config = {
-    "headers": [],
-    "specs": [
-        {
-            "endpoint": "apispec",
-            "route": "/apispec.json",
-            "rule_filter": lambda rule: True,
-            "model_filter": lambda tag: True,
-        }
-    ],
-    "swagger_ui": True,
-    "specs_route": "/docs/"
-}
-swagger = Swagger(app, config=swagger_config)
-
 # -------------------------
-# Environment & API Setup
+# Environment / AWS Setup
 # -------------------------
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-aws_access_key = os.getenv("AWS_ACCESS_KEY")
-aws_secret_key = os.getenv("AWS_SECRET_KEY")
-aws_region = os.getenv("AWS_REGION", "us-east-1")
+TEMP_BUCKET = "hhfuservideo-temp"
+PERM_BUCKET = "hhfuservideo"
 
 s3_client = boto3.client(
     "s3",
-    aws_access_key_id=aws_access_key,
-    aws_secret_access_key=aws_secret_key,
-    region_name=aws_region
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
 )
 
-# -------------------------
-# Root Page with Video Preview
-# -------------------------
-@app.route("/")
-def index():
-    html = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>HHF Video Generator</title>
-    </head>
-    <body>
-        <h2>HHF Video Generator</h2>
+rekognition = boto3.client(
+    "rekognition",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
+)
 
-        <label>Prompt Text:</label>
-        <input type="text" id="prompt_text" value="A cat riding a skateboard"><br><br>
+ses_client = boto3.client(
+    "ses",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
+)
 
-        <label>Image URL:</label>
-        <input type="text" id="prompt_image" value="https://example.com/cat.png"><br><br>
-
-        <button onclick="generateVideo()">Generate Video</button><br><br>
-
-        <video id="video_player" width="480" height="270" controls autoplay>
-            <source id="video_source" src="" type="video/mp4">
-            Your browser does not support the video tag.
-        </video>
-
-        <pre id="output"></pre>
-
-        <script>
-            async function generateVideo() {
-                const prompt_text = document.getElementById('prompt_text').value;
-                const prompt_image = document.getElementById('prompt_image').value;
-
-                const response = await fetch('/generate-video', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({prompt_text, prompt_image})
-                });
-
-                const data = await response.json();
-                document.getElementById('output').innerText = JSON.stringify(data, null, 2);
-
-                if (data.status === 'success') {
-                    const video_url = data.video_url;
-                    const videoSource = document.getElementById('video_source');
-                    videoSource.src = video_url;
-                    document.getElementById('video_player').load();
-                }
-            }
-        </script>
-
-        <p>Swagger docs available at <a href="/docs/">/docs/</a></p>
-    </body>
-    </html>
-    """
-    return render_template_string(html)
+NOTIFY_EMAIL = "Antoinemaxwell0@gmail.com"
 
 # -------------------------
-# Test Video Endpoint
+# Helpers
 # -------------------------
-@app.route("/test-video")
-def test_video():
-    return jsonify({
-        "status": "success",
-        "message": "Video endpoint reachable!",
-        "video_url": "https://example.com/test_video.mp4"
-    })
-
-# -------------------------
-# Test Stripe Payment Endpoint
-# -------------------------
-@app.route("/test-payment")
-def test_payment():
+def get_video_duration(file_path):
+    """Return video duration in seconds using ffmpeg."""
     try:
-        intent = stripe.PaymentIntent.create(
-            amount=1000,  # $10
-            currency='usd',
-            payment_method_types=['card']
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
-        return jsonify({"status": "success", "payment_intent": intent})
+        return float(result.stdout)
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+        print("FFprobe error:", e)
+        return None
+
+def send_email_notification(subject, body):
+    try:
+        ses_client.send_email(
+            Source=NOTIFY_EMAIL,
+            Destination={"ToAddresses": [NOTIFY_EMAIL]},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": body}}
+            }
+        )
+    except ClientError as e:
+        print("SES email error:", e)
 
 # -------------------------
-# Video Generation Endpoint
+# Video Upload Endpoint
 # -------------------------
-@app.route("/generate-video", methods=["POST"])
-def generate_video():
-    data = request.get_json()
-    prompt_text = data.get("prompt_text")
-    prompt_image = data.get("prompt_image")
+@app.route("/upload-video", methods=["POST"])
+def upload_video():
+    if "video" not in request.files:
+        return jsonify({"status": "error", "message": "No video file provided"}), 400
 
-    # TODO: replace with real AI video generation logic
-    # For now, return a dummy video URL for testing
-    video_url = "https://example.com/generated_video.mp4"
+    file = request.files["video"]
+    filename = file.filename
+    ext = filename.split('.')[-1].lower()
+    if ext not in ["mp4", "mov", "avi", "mkv"]:
+        return jsonify({"status": "error", "message": "Unsupported video format"}), 400
 
-    return jsonify({
-        "status": "success",
-        "prompt_text": prompt_text,
-        "prompt_image": prompt_image,
-        "video_url": video_url
-    })
+    # Save video temporarily
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+    file.save(tmp_file.name)
+
+    # Check duration
+    duration = get_video_duration(tmp_file.name)
+    if duration is None:
+        return jsonify({"status": "error", "message": "Could not determine video duration"}), 400
+    if duration < 15 or duration > 210:  # 3:30 = 210 sec
+        return jsonify({"status": "error", "message": "Video must be between 15s and 3:30s"}), 400
+
+    # Upload to temp S3 bucket
+    temp_key = f"{uuid.uuid4()}.{ext}"
+    s3_client.upload_file(tmp_file.name, TEMP_BUCKET, temp_key, ExtraArgs={"ACL": "private"})
+
+    # Start Rekognition moderation
+    try:
+        response = rekognition.start_content_moderation(
+            Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
+            MinConfidence=80
+        )
+        job_id = response["JobId"]
+
+        # Poll until Rekognition finishes
+        while True:
+            result = rekognition.get_content_moderation(JobId=job_id)
+            status = result.get("JobStatus")
+            if status in ["SUCCEEDED", "FAILED"]:
+                break
+            import time
+            time.sleep(5)
+
+        if status == "FAILED":
+            send_email_notification("Video Rejected", f"Rekognition failed for video: {filename}")
+            return jsonify({"status": "rejected", "reason": "Moderation failed"}), 400
+
+        moderation_labels = result.get("ModerationLabels", [])
+        if moderation_labels:
+            # Rejected
+            send_email_notification(
+                "Video Rejected",
+                f"Your uploaded video '{filename}' was rejected by Rekognition: {moderation_labels}"
+            )
+            s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+            return jsonify({"status": "rejected", "reason": "Video failed moderation"}), 400
+
+        # Approved: Move video to permanent bucket
+        perm_key = f"{uuid.uuid4()}.{ext}"
+        copy_source = {"Bucket": TEMP_BUCKET, "Key": temp_key}
+        s3_client.copy_object(Bucket=PERM_BUCKET, Key=perm_key, CopySource=copy_source, ACL="public-read")
+        s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+
+        video_url = f"https://{PERM_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{perm_key}"
+        return jsonify({"status": "success", "video_url": video_url})
+
+    except Exception as e:
+        print("Error:", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # -------------------------
 # Run App

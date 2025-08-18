@@ -7,9 +7,29 @@ import threading
 import subprocess
 import time
 from botocore.exceptions import ClientError
+from flasgger import Swagger
 
 app = Flask(__name__)
 CORS(app)
+
+# -------------------------
+# Flasgger Swagger config
+# -------------------------
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": 'apispec',
+            "route": '/apispec.json',
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
+        }
+    ],
+    "swagger_ui": True,
+    "specs_route": "/docs/"
+}
+
+swagger = Swagger(app, config=swagger_config)
 
 # -------------------------
 # AWS setup
@@ -48,7 +68,6 @@ NOTIFY_EMAIL = "Antoinemaxwell0@gmail.com"
 # Helpers
 # -------------------------
 def get_video_duration(file_path):
-    """Return video duration in seconds using ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
@@ -76,9 +95,7 @@ def send_email_notification(subject, body):
         print("SES email error:", e)
 
 def moderate_video_async(temp_key, filename, metadata):
-    """Moderate and move approved videos asynchronously."""
     try:
-        # Download temporarily to check duration
         tmp_file = f"/tmp/{uuid.uuid4()}_{filename}"
         s3_client.download_file(TEMP_BUCKET, temp_key, tmp_file)
         duration = get_video_duration(tmp_file)
@@ -87,14 +104,12 @@ def moderate_video_async(temp_key, filename, metadata):
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             return
 
-        # Start Rekognition moderation
         response = rekognition.start_content_moderation(
             Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
             MinConfidence=90
         )
         job_id = response["JobId"]
 
-        # Poll until Rekognition finishes
         while True:
             result = rekognition.get_content_moderation(JobId=job_id)
             status = result.get("JobStatus")
@@ -104,11 +119,9 @@ def moderate_video_async(temp_key, filename, metadata):
 
         moderation_labels = result.get("ModerationLabels", [])
         if status == "FAILED" or moderation_labels:
-            # Rejected: delete temp video
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             print(f"Video '{filename}' rejected by Rekognition.")
         else:
-            # Approved: move to permanent bucket
             perm_key = f"{uuid.uuid4()}_{filename}"
             copy_source = {"Bucket": TEMP_BUCKET, "Key": temp_key}
             s3_client.copy_object(
@@ -134,10 +147,49 @@ def moderate_video_async(temp_key, filename, metadata):
             pass
 
 # -------------------------
+# Root route for testing
+# -------------------------
+@app.route("/", methods=["GET"])
+def index():
+    return "<h2>HHF Video Upload Backend is Live!</h2><p>Use POST /get-upload-url to test presigned URLs.</p>"
+
+# -------------------------
 # Pre-signed URL Endpoint
 # -------------------------
 @app.route("/get-upload-url", methods=["POST"])
 def get_upload_url():
+    """
+    Get presigned S3 URL
+    ---
+    parameters:
+      - name: body
+        in: body
+        schema:
+          type: object
+          properties:
+            email:
+              type: string
+            videoType:
+              type: string
+            comments:
+              type: string
+            consent:
+              type: boolean
+            filename:
+              type: string
+          required:
+            - email
+            - videoType
+            - consent
+            - filename
+    responses:
+      200:
+        description: URL generated successfully
+      400:
+        description: Missing required fields
+      500:
+        description: Internal server error
+    """
     data = request.get_json()
     email = data.get("email", "").strip()
     video_type = data.get("videoType", "").strip()
@@ -166,7 +218,6 @@ def get_upload_url():
             ExpiresIn=3600
         )
 
-        # Start moderation asynchronously
         threading.Thread(target=moderate_video_async, args=(temp_key, filename, {
             "email": email,
             "videoType": video_type,

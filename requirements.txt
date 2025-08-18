@@ -1,4 +1,4 @@
-Flask==2.3.3
+Flask==2.2.5
 boto3==1.28.45
 python-dotenv==1.0.0
 stripe==12.4.0

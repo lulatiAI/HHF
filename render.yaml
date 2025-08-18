@@ -3,7 +3,7 @@ services:
     name: hhf
     env: python
     plan: free
-    pythonVersion: "3.12.15"   # Downgrade to Python 3.12
+    pythonVersion: "3.12.15"
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
       pip install --upgrade pip

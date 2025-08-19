@@ -63,9 +63,6 @@ def is_image(filename: str) -> bool:
     return pathlib.Path(filename.lower()).suffix in IMAGE_EXTS
 
 def get_video_duration(file_path):
-    """
-    Try ffprobe. If not available or fails, return None (do NOT fail the upload).
-    """
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
@@ -97,12 +94,8 @@ def send_email_notification(subject, body):
         print("SES email error:", e)
 
 def approve_and_move(temp_key: str, filename: str, metadata: dict):
-    """
-    Copy the object from TEMP to PERM, apply metadata, then delete the temp object.
-    """
     perm_key = f"{uuid.uuid4()}_{filename}"
     copy_source = {"Bucket": TEMP_BUCKET, "Key": temp_key}
-    # No ACL here (Object Ownership is bucket owner enforced)
     s3_client.copy_object(
         Bucket=PERM_BUCKET,
         Key=perm_key,
@@ -120,14 +113,12 @@ def approve_and_move(temp_key: str, filename: str, metadata: dict):
 
 def moderate_video(temp_key, filename, metadata):
     try:
-        # Download to /tmp for optional duration check
         tmp_file = f"/tmp/{uuid.uuid4()}_{filename}"
         s3_client.download_file(TEMP_BUCKET, temp_key, tmp_file)
 
         ext = pathlib.Path(filename.lower()).suffix
         print(f"Moderation start for {filename} (ext={ext})")
 
-        # Optional duration gate (only if ffprobe is available and returns a value)
         duration = get_video_duration(tmp_file) if is_video(filename) else None
         if duration is not None:
             if duration < 15 or duration > 240:
@@ -135,9 +126,7 @@ def moderate_video(temp_key, filename, metadata):
                 s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
                 return
 
-        # Rekognition: video vs image
         if is_video(filename):
-            # Async moderation for video
             response = rekognition.start_content_moderation(
                 Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
                 MinConfidence=90,
@@ -161,7 +150,6 @@ def moderate_video(temp_key, filename, metadata):
             approve_and_move(temp_key, filename, metadata)
 
         elif is_image(filename):
-            # Sync moderation for image
             result = rekognition.detect_moderation_labels(
                 Image={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
                 MinConfidence=90,
@@ -175,20 +163,18 @@ def moderate_video(temp_key, filename, metadata):
             approve_and_move(temp_key, filename, metadata)
 
         else:
-            # Unknown file type: approve without Rekognition (or you can choose to reject)
             print("Unknown file type – skipping Rekognition and approving.")
             approve_and_move(temp_key, filename, metadata)
 
     except Exception as e:
         print("Moderation error:", e)
-        # Best effort cleanup of temp object
         try:
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
         except Exception:
             pass
 
 # -------------------------
-# Root / webhook
+# Routes
 # -------------------------
 @app.route("/", methods=["POST", "GET"])
 def index():
@@ -208,9 +194,6 @@ def index():
 
     return "✅ Backend is running and ready for Forminator webhooks"
 
-# -------------------------
-# Pre-signed URL Endpoint (PUT)
-# -------------------------
 @app.route("/get-upload-url", methods=["POST"])
 def get_upload_url():
     data = request.get_json() or {}
@@ -227,7 +210,6 @@ def get_upload_url():
     content_type = data.get("contentType") or guess_content_type(filename)
 
     try:
-        # IMPORTANT: no ACL, no Metadata here — keeps signature simple
         presigned_url = s3_client.generate_presigned_url(
             ClientMethod="put_object",
             Params={
@@ -246,9 +228,6 @@ def get_upload_url():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# -------------------------
-# Post-upload confirmation Endpoint
-# -------------------------
 @app.route("/confirm-upload", methods=["POST"])
 def confirm_upload():
     data = request.get_json() or {}
@@ -263,14 +242,10 @@ def confirm_upload():
 
     metadata = {"email": email, "videoType": video_type, "comments": comments}
 
-    # process in background
     threading.Thread(target=moderate_video, args=(temp_key, filename, metadata), daemon=True).start()
 
     return jsonify({"status": "success", "message": "Moderation started"})
 
-# -------------------------
-# Test route
-# -------------------------
 @app.route("/test")
 def test():
     return jsonify({"status": "ok", "message": "Server is live"})

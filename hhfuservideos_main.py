@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import os
 import boto3
@@ -48,7 +48,6 @@ NOTIFY_EMAIL = os.getenv("NOTIFICATION_EMAIL")
 # Helpers
 # -------------------------
 def get_video_duration(file_path):
-    """Return video duration in seconds using ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
@@ -76,7 +75,6 @@ def send_email_notification(subject, body):
         print("SES email error:", e)
 
 def moderate_video(temp_key, filename, metadata):
-    """Moderate and move approved videos after upload confirmation."""
     try:
         tmp_file = f"/tmp/{uuid.uuid4()}_{filename}"
         s3_client.download_file(TEMP_BUCKET, temp_key, tmp_file)
@@ -93,7 +91,6 @@ def moderate_video(temp_key, filename, metadata):
         )
         job_id = response["JobId"]
 
-        # Wait for moderation results
         while True:
             result = rekognition.get_content_moderation(JobId=job_id)
             status = result.get("JobStatus")
@@ -129,6 +126,14 @@ def moderate_video(temp_key, filename, metadata):
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
         except:
             pass
+
+# -------------------------
+# Serve HTML
+# -------------------------
+@app.route("/")
+def index():
+    html_content = open("index.html").read()
+    return render_template_string(html_content)
 
 # -------------------------
 # Pre-signed URL Endpoint
@@ -185,6 +190,13 @@ def confirm_upload():
     threading.Thread(target=moderate_video, args=(temp_key, filename, metadata)).start()
 
     return jsonify({"status": "success", "message": "Moderation started"})
+
+# -------------------------
+# Test route
+# -------------------------
+@app.route("/test")
+def test():
+    return jsonify({"status": "ok", "message": "Server is live"})
 
 # -------------------------
 # Run App

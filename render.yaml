@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: hhf
+    name: hhf-user-videos
     env: python
     plan: free
     pythonVersion: "3.12.15"
@@ -20,11 +20,7 @@ services:
         sync: false
       - key: PORT
         sync: false
-      - key: S3_BUCKET_ADVERTISING
+      - key: S3_BUCKET_USER
         sync: false
-      - key: S3_BUCKET_MUSIC_PROMO
-        sync: false
-      - key: S3_BUCKET_USER_VIDEOS
-        sync: false
-      - key: SNS_TOPIC_ARN
+      - key: S3_BUCKET_MUSICIAN
         sync: false

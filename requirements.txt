@@ -1,12 +1,6 @@
-# --- Web/API ---
 Flask==2.2.5
-flask-cors==4.0.0
-flasgger==0.9.7
+flask-cors==6.0.1
+boto3==1.28.45
+python-dotenv==1.0.0
+ffmpeg-python==0.2.0
 gunicorn==21.2.0
-requests==2.32.3
-
-# --- AWS ---
-boto3>=1.28,<2
-
-# --- Env variables ---
-python-dotenv==1.0.1

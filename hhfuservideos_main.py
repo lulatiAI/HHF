@@ -164,4 +164,120 @@ def moderate_video(temp_key, filename, metadata):
             # Sync moderation for image
             result = rekognition.detect_moderation_labels(
                 Image={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
-                MinC
+                MinConfidence=90,
+            )
+            labels = result.get("ModerationLabels", [])
+            if labels:
+                print(f"Rejected by Rekognition (image). Labels: {labels}")
+                s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+                return
+
+            approve_and_move(temp_key, filename, metadata)
+
+        else:
+            # Unknown file type: approve without Rekognition (or you can choose to reject)
+            print("Unknown file type – skipping Rekognition and approving.")
+            approve_and_move(temp_key, filename, metadata)
+
+    except Exception as e:
+        print("Moderation error:", e)
+        # Best effort cleanup of temp object
+        try:
+            s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+        except Exception:
+            pass
+
+# -------------------------
+# Root / webhook
+# -------------------------
+@app.route("/", methods=["POST", "GET"])
+def index():
+    if request.method == "POST":
+        data = request.get_json() or request.form.to_dict()
+        try:
+            key = f"form_submissions/{uuid.uuid4()}.json"
+            s3_client.put_object(
+                Bucket=TEMP_BUCKET,
+                Key=key,
+                Body=str(data),
+                Metadata={"source": "forminator"},
+            )
+            return jsonify({"status": "success", "saved_to": key}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    return "✅ Backend is running and ready for Forminator webhooks"
+
+# -------------------------
+# Pre-signed URL Endpoint (PUT)
+# -------------------------
+@app.route("/get-upload-url", methods=["POST"])
+def get_upload_url():
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip()
+    video_type = (data.get("videoType") or "").strip()
+    comments = (data.get("comments") or "").strip()
+    consent = data.get("consent", True)
+    filename = data.get("filename")
+
+    if not email or not video_type or not consent or not filename:
+        return jsonify({"status": "error", "message": "Missing required fields"}), 400
+
+    temp_key = f"{uuid.uuid4()}_{filename}"
+    content_type = data.get("contentType") or guess_content_type(filename)
+
+    try:
+        # IMPORTANT: no ACL, no Metadata here — keeps signature simple
+        presigned_url = s3_client.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": TEMP_BUCKET,
+                "Key": temp_key,
+                "ContentType": content_type,
+            },
+            ExpiresIn=3600,
+        )
+        return jsonify({
+            "status": "success",
+            "upload_url": presigned_url,
+            "temp_key": temp_key,
+            "required_headers": {"Content-Type": content_type},
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# -------------------------
+# Post-upload confirmation Endpoint
+# -------------------------
+@app.route("/confirm-upload", methods=["POST"])
+def confirm_upload():
+    data = request.get_json() or {}
+    temp_key = data.get("temp_key")
+    filename = data.get("filename")
+    email = data.get("email")
+    video_type = data.get("videoType")
+    comments = data.get("comments", "")
+
+    if not temp_key or not filename or not email or not video_type:
+        return jsonify({"status": "error", "message": "Missing required fields"}), 400
+
+    metadata = {"email": email, "videoType": video_type, "comments": comments}
+
+    # process in background
+    threading.Thread(target=moderate_video, args=(temp_key, filename, metadata), daemon=True).start()
+
+    return jsonify({"status": "success", "message": "Moderation started"})
+
+# -------------------------
+# Test route
+# -------------------------
+@app.route("/test")
+def test():
+    return jsonify({"status": "ok", "message": "Server is live"})
+
+# -------------------------
+# Run App
+# -------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

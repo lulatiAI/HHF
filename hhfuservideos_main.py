@@ -73,12 +73,14 @@ def approve_and_move(temp_key: str, filename: str, metadata: dict):
         MetadataDirective="REPLACE",
     )
     s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
-    video_url = generate_presigned_get(PERM_BUCKET, perm_key)
-    print(f"Approved: {perm_key}, presigned URL: {video_url}")
+    presigned_url = generate_presigned_get(PERM_BUCKET, perm_key)
+    return perm_key, presigned_url
 
-def moderate_video(temp_key, filename, metadata):
+def moderate_video(temp_key, filename, metadata, callback):
     try:
-        # Skip downloading, just moderate via Rekognition for simplicity
+        approved = False
+        presigned_url = None
+
         if is_video(filename):
             response = rekognition.start_content_moderation(
                 Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
@@ -91,26 +93,31 @@ def moderate_video(temp_key, filename, metadata):
                     break
                 time.sleep(5)
             labels = result.get("ModerationLabels", [])
-            if labels:
-                print(f"Rejected video due to labels: {labels}")
-                s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
-                return
+            if not labels:
+                approved = True
 
         elif is_image(filename):
             result = rekognition.detect_moderation_labels(
                 Image={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
                 MinConfidence=90,
             )
-            if result.get("ModerationLabels"):
-                print(f"Rejected image due to labels")
-                s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
-                return
+            if not result.get("ModerationLabels"):
+                approved = True
 
-        approve_and_move(temp_key, filename, metadata)
+        else:
+            approved = True  # unknown file type, approve by default
+
+        if approved:
+            perm_key, presigned_url = approve_and_move(temp_key, filename, metadata)
+            callback(success=True, perm_key=perm_key, presigned_url=presigned_url)
+        else:
+            s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+            callback(success=False, perm_key=None, presigned_url=None)
 
     except Exception as e:
         print("Moderation error:", e)
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+        callback(success=False, perm_key=None, presigned_url=None)
 
 # -------------------------
 # Routes
@@ -157,22 +164,27 @@ def confirm_upload():
         return jsonify({"status": "error", "message": "Missing required fields"}), 400
 
     metadata = {"email": email, "videoType": video_type, "comments": comments}
-    threading.Thread(target=moderate_video, args=(temp_key, filename, metadata), daemon=True).start()
-    return jsonify({"status": "success", "message": "Moderation started"})
 
-@app.route("/get-perm-video", methods=["POST"])
-def get_perm_video():
-    """Return a presigned URL for a permanent video after moderation"""
-    data = request.get_json() or {}
-    perm_key = data.get("perm_key")
-    if not perm_key:
-        return jsonify({"status": "error", "message": "Missing perm_key"}), 400
+    # Thread callback to return the presigned URL after moderation
+    result_data = {}
 
-    url = generate_presigned_get(PERM_BUCKET, perm_key)
-    if not url:
-        return jsonify({"status": "error", "message": "Could not generate URL"}), 500
+    def callback(success, perm_key, presigned_url):
+        result_data["success"] = success
+        result_data["perm_key"] = perm_key
+        result_data["video_url"] = presigned_url
 
-    return jsonify({"status": "success", "video_url": url})
+    thread = threading.Thread(target=moderate_video, args=(temp_key, filename, metadata, callback))
+    thread.start()
+    thread.join()  # wait for moderation to finish before returning response
+
+    if result_data.get("success"):
+        return jsonify({
+            "status": "success",
+            "perm_key": result_data["perm_key"],
+            "video_url": result_data["video_url"]
+        })
+    else:
+        return jsonify({"status": "error", "message": "Video failed moderation"}), 400
 
 @app.route("/test")
 def test():

@@ -1,26 +1,21 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import boto3
 import uuid
-import threading
-import mimetypes
 import pathlib
+import mimetypes
+import threading
 import time
-from botocore.exceptions import ClientError
+import os
 import logging
+from typing import Optional, Dict, List
 
 # -------------------------
-# Logging setup
+# Logging
 # -------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
-# -------------------------
-# Flask app
-# -------------------------
-app = Flask(__name__)
-CORS(app)
 
 # -------------------------
 # AWS setup
@@ -50,6 +45,35 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
 
 # -------------------------
+# FastAPI app
+# -------------------------
+app = FastAPI(title="Video Upload API with Moderation")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------
+# Pydantic models
+# -------------------------
+class UploadRequest(BaseModel):
+    filename: str
+    email: str
+    videoType: str
+    consent: Optional[bool] = True
+
+class ConfirmUploadRequest(BaseModel):
+    temp_key: str
+    filename: str
+    email: str
+    videoType: str
+    comments: Optional[str] = ""
+
+# -------------------------
 # Helpers
 # -------------------------
 def guess_content_type(filename: str) -> str:
@@ -62,23 +86,23 @@ def is_video(filename: str) -> bool:
 def is_image(filename: str) -> bool:
     return pathlib.Path(filename.lower()).suffix in IMAGE_EXTS
 
-def generate_presigned_get(bucket, key, expires=3600):
+def generate_presigned_get(bucket: str, key: str, expires: int = 3600) -> Optional[str]:
     try:
         url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires,
         )
-        logger.info(f"Generated presigned GET URL: {url}")
+        logger.info(f"Generated presigned GET URL for {key}")
         return url
     except Exception as e:
-        logger.error(f"Error generating presigned URL: {e}")
+        logger.error(f"Error generating presigned GET URL: {e}")
         return None
 
-def approve_and_move(temp_key: str, filename: str, metadata: dict):
+def approve_and_move(temp_key: str, filename: str, metadata: Dict[str, str]):
     try:
         perm_key = f"{uuid.uuid4()}_{filename}"
-        logger.info(f"Copying {temp_key} to permanent bucket as {perm_key}")
+        logger.info(f"Moving {temp_key} to permanent bucket as {perm_key}")
         s3_client.copy_object(
             Bucket=PERM_BUCKET,
             Key=perm_key,
@@ -91,10 +115,10 @@ def approve_and_move(temp_key: str, filename: str, metadata: dict):
         logger.info(f"Move successful: {perm_key}")
         return perm_key, presigned_url
     except Exception as e:
-        logger.error(f"Error moving file to permanent bucket: {e}")
+        logger.error(f"Error moving file: {e}")
         return None, None
 
-def moderate_video(temp_key, filename, metadata, callback):
+def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callback):
     try:
         approved = False
         presigned_url = None
@@ -108,7 +132,6 @@ def moderate_video(temp_key, filename, metadata, callback):
             )
             job_id = response["JobId"]
             logger.info(f"Moderation job started: {job_id}")
-
             while True:
                 result = rekognition.get_content_moderation(JobId=job_id)
                 if result.get("JobStatus") in ["SUCCEEDED", "FAILED"]:
@@ -118,7 +141,6 @@ def moderate_video(temp_key, filename, metadata, callback):
             labels = result.get("ModerationLabels", [])
             if not labels:
                 approved = True
-
         elif is_image(filename):
             result = rekognition.detect_moderation_labels(
                 Image={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
@@ -126,71 +148,55 @@ def moderate_video(temp_key, filename, metadata, callback):
             )
             if not result.get("ModerationLabels"):
                 approved = True
-
         else:
-            approved = True  # unknown file type, approve by default
+            approved = True  # unknown type, approve by default
 
         if approved:
             perm_key, presigned_url = approve_and_move(temp_key, filename, metadata)
             callback(success=True, perm_key=perm_key, presigned_url=presigned_url)
         else:
-            logger.info(f"File {filename} failed moderation, deleting")
+            logger.info(f"{filename} failed moderation, deleting from temp bucket")
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             callback(success=False, perm_key=None, presigned_url=None)
-
     except Exception as e:
         logger.error(f"Moderation error: {e}")
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
         callback(success=False, perm_key=None, presigned_url=None)
 
 # -------------------------
-# Routes
+# Endpoints
 # -------------------------
-@app.route("/get-upload-url", methods=["POST"])
-def get_upload_url():
-    data = request.get_json() or {}
-    filename = data.get("filename")
-    email = data.get("email")
-    video_type = data.get("videoType")
-    consent = data.get("consent", True)
+@app.get("/test")
+def test():
+    logger.info("Test endpoint called")
+    return {"status": "ok", "message": "Server is live"}
 
-    if not filename or not email or not video_type or not consent:
-        return jsonify({"status": "error", "message": "Missing required fields"}), 400
-
-    temp_key = f"{uuid.uuid4()}_{filename}"
-    content_type = guess_content_type(filename)
-
+@app.post("/get-upload-url")
+def get_upload_url(req: UploadRequest):
+    if not req.filename or not req.email or not req.videoType or not req.consent:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    temp_key = f"{uuid.uuid4()}_{req.filename}"
+    content_type = guess_content_type(req.filename)
     try:
         presigned_url = s3_client.generate_presigned_url(
             "put_object",
             Params={"Bucket": TEMP_BUCKET, "Key": temp_key, "ContentType": content_type},
             ExpiresIn=3600,
         )
-        logger.info(f"Generated upload URL for {filename} -> {temp_key}")
-        return jsonify({
+        logger.info(f"Generated presigned upload URL for {req.filename} -> {temp_key}")
+        return {
             "status": "success",
             "upload_url": presigned_url,
             "temp_key": temp_key,
             "required_headers": {"Content-Type": content_type},
-        })
+        }
     except Exception as e:
         logger.error(f"Error generating upload URL: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route("/confirm-upload", methods=["POST"])
-def confirm_upload():
-    data = request.get_json() or {}
-    temp_key = data.get("temp_key")
-    filename = data.get("filename")
-    email = data.get("email")
-    video_type = data.get("videoType")
-    comments = data.get("comments", "")
-
-    if not temp_key or not filename or not email or not video_type:
-        return jsonify({"status": "error", "message": "Missing required fields"}), 400
-
-    metadata = {"email": email, "videoType": video_type, "comments": comments}
-
+@app.post("/confirm-upload")
+def confirm_upload(req: ConfirmUploadRequest):
+    metadata = {"email": req.email, "videoType": req.videoType, "comments": req.comments}
     result_data = {}
 
     def callback(success, perm_key, presigned_url):
@@ -198,29 +204,42 @@ def confirm_upload():
         result_data["perm_key"] = perm_key
         result_data["video_url"] = presigned_url
 
-    thread = threading.Thread(target=moderate_video, args=(temp_key, filename, metadata, callback))
+    thread = threading.Thread(target=moderate_video, args=(req.temp_key, req.filename, metadata, callback))
     thread.start()
     thread.join()
 
     if result_data.get("success"):
-        logger.info(f"Video approved and moved: {result_data['perm_key']}")
-        return jsonify({
+        logger.info(f"Video approved: {result_data['perm_key']}")
+        return {
             "status": "success",
             "perm_key": result_data["perm_key"],
-            "video_url": result_data["video_url"]
-        })
+            "video_url": result_data["video_url"],
+        }
     else:
         logger.info("Video failed moderation")
-        return jsonify({"status": "error", "message": "Video failed moderation"}), 400
-
-@app.route("/test")
-def test():
-    logger.info("Test endpoint called")
-    return jsonify({"status": "ok", "message": "Server is live"})
+        raise HTTPException(status_code=400, detail="Video failed moderation")
 
 # -------------------------
-# Run App
+# List S3 files endpoints
 # -------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+@app.get("/list-temp-files")
+def list_temp_files() -> List[str]:
+    try:
+        response = s3_client.list_objects_v2(Bucket=TEMP_BUCKET)
+        files = [obj["Key"] for obj in response.get("Contents", [])]
+        logger.info(f"Temp bucket files: {files}")
+        return files
+    except Exception as e:
+        logger.error(f"Error listing temp files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/list-perm-files")
+def list_perm_files() -> List[str]:
+    try:
+        response = s3_client.list_objects_v2(Bucket=PERM_BUCKET)
+        files = [obj["Key"] for obj in response.get("Contents", [])]
+        logger.info(f"Permanent bucket files: {files}")
+        return files
+    except Exception as e:
+        logger.error(f"Error listing permanent files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

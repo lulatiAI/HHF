@@ -18,8 +18,9 @@ AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-TEMP_BUCKET = os.getenv("S3_BUCKET_USER")
-PERM_BUCKET = os.getenv("S3_BUCKET_MUSICIAN")
+# Updated to your real bucket names
+TEMP_BUCKET = "hhftempuservids"
+PERM_BUCKET = "hhfuservideos"
 
 s3_client = boto3.client(
     "s3",

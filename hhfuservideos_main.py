@@ -8,7 +8,17 @@ import mimetypes
 import pathlib
 import time
 from botocore.exceptions import ClientError
+import logging
 
+# -------------------------
+# Logging setup
+# -------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+# -------------------------
+# Flask app
+# -------------------------
 app = Flask(__name__)
 CORS(app)
 
@@ -54,32 +64,42 @@ def is_image(filename: str) -> bool:
 
 def generate_presigned_get(bucket, key, expires=3600):
     try:
-        return s3_client.generate_presigned_url(
+        url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires,
         )
+        logger.info(f"Generated presigned GET URL: {url}")
+        return url
     except Exception as e:
-        print("Error generating presigned URL:", e)
+        logger.error(f"Error generating presigned URL: {e}")
         return None
 
 def approve_and_move(temp_key: str, filename: str, metadata: dict):
-    perm_key = f"{uuid.uuid4()}_{filename}"
-    s3_client.copy_object(
-        Bucket=PERM_BUCKET,
-        Key=perm_key,
-        CopySource={"Bucket": TEMP_BUCKET, "Key": temp_key},
-        Metadata=metadata,
-        MetadataDirective="REPLACE",
-    )
-    s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
-    presigned_url = generate_presigned_get(PERM_BUCKET, perm_key)
-    return perm_key, presigned_url
+    try:
+        perm_key = f"{uuid.uuid4()}_{filename}"
+        logger.info(f"Copying {temp_key} to permanent bucket as {perm_key}")
+        s3_client.copy_object(
+            Bucket=PERM_BUCKET,
+            Key=perm_key,
+            CopySource={"Bucket": TEMP_BUCKET, "Key": temp_key},
+            Metadata=metadata,
+            MetadataDirective="REPLACE",
+        )
+        s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+        presigned_url = generate_presigned_get(PERM_BUCKET, perm_key)
+        logger.info(f"Move successful: {perm_key}")
+        return perm_key, presigned_url
+    except Exception as e:
+        logger.error(f"Error moving file to permanent bucket: {e}")
+        return None, None
 
 def moderate_video(temp_key, filename, metadata, callback):
     try:
         approved = False
         presigned_url = None
+
+        logger.info(f"Starting moderation for {filename}")
 
         if is_video(filename):
             response = rekognition.start_content_moderation(
@@ -87,10 +107,13 @@ def moderate_video(temp_key, filename, metadata, callback):
                 MinConfidence=90,
             )
             job_id = response["JobId"]
+            logger.info(f"Moderation job started: {job_id}")
+
             while True:
                 result = rekognition.get_content_moderation(JobId=job_id)
                 if result.get("JobStatus") in ["SUCCEEDED", "FAILED"]:
                     break
+                logger.info("Waiting for moderation result...")
                 time.sleep(5)
             labels = result.get("ModerationLabels", [])
             if not labels:
@@ -111,11 +134,12 @@ def moderate_video(temp_key, filename, metadata, callback):
             perm_key, presigned_url = approve_and_move(temp_key, filename, metadata)
             callback(success=True, perm_key=perm_key, presigned_url=presigned_url)
         else:
+            logger.info(f"File {filename} failed moderation, deleting")
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             callback(success=False, perm_key=None, presigned_url=None)
 
     except Exception as e:
-        print("Moderation error:", e)
+        logger.error(f"Moderation error: {e}")
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
         callback(success=False, perm_key=None, presigned_url=None)
 
@@ -142,6 +166,7 @@ def get_upload_url():
             Params={"Bucket": TEMP_BUCKET, "Key": temp_key, "ContentType": content_type},
             ExpiresIn=3600,
         )
+        logger.info(f"Generated upload URL for {filename} -> {temp_key}")
         return jsonify({
             "status": "success",
             "upload_url": presigned_url,
@@ -149,6 +174,7 @@ def get_upload_url():
             "required_headers": {"Content-Type": content_type},
         })
     except Exception as e:
+        logger.error(f"Error generating upload URL: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/confirm-upload", methods=["POST"])
@@ -165,7 +191,6 @@ def confirm_upload():
 
     metadata = {"email": email, "videoType": video_type, "comments": comments}
 
-    # Thread callback to return the presigned URL after moderation
     result_data = {}
 
     def callback(success, perm_key, presigned_url):
@@ -175,19 +200,22 @@ def confirm_upload():
 
     thread = threading.Thread(target=moderate_video, args=(temp_key, filename, metadata, callback))
     thread.start()
-    thread.join()  # wait for moderation to finish before returning response
+    thread.join()
 
     if result_data.get("success"):
+        logger.info(f"Video approved and moved: {result_data['perm_key']}")
         return jsonify({
             "status": "success",
             "perm_key": result_data["perm_key"],
             "video_url": result_data["video_url"]
         })
     else:
+        logger.info("Video failed moderation")
         return jsonify({"status": "error", "message": "Video failed moderation"}), 400
 
 @app.route("/test")
 def test():
+    logger.info("Test endpoint called")
     return jsonify({"status": "ok", "message": "Server is live"})
 
 # -------------------------
@@ -195,4 +223,4 @@ def test():
 # -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)

@@ -149,7 +149,7 @@ def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callba
             if not result.get("ModerationLabels"):
                 approved = True
         else:
-            approved = True  # unknown type, approve by default
+            approved = True
 
         if approved:
             perm_key, presigned_url = approve_and_move(temp_key, filename, metadata)
@@ -183,11 +183,11 @@ def get_upload_url(req: UploadRequest):
             Params={"Bucket": TEMP_BUCKET, "Key": temp_key, "ContentType": content_type},
             ExpiresIn=3600,
         )
-        logger.info(f"Generated presigned upload URL for {req.filename} -> {temp_key}")
+        logger.info(f"Generated presigned upload URL for {req.filename}")
+        # Return only the presigned URL and headers
         return {
             "status": "success",
             "upload_url": presigned_url,
-            "temp_key": temp_key,
             "required_headers": {"Content-Type": content_type},
         }
     except Exception as e:
@@ -201,18 +201,16 @@ def confirm_upload(req: ConfirmUploadRequest):
 
     def callback(success, perm_key, presigned_url):
         result_data["success"] = success
-        result_data["perm_key"] = perm_key
-        result_data["video_url"] = presigned_url
+        result_data["video_url"] = presigned_url  # Only URL, no S3 key
 
     thread = threading.Thread(target=moderate_video, args=(req.temp_key, req.filename, metadata, callback))
     thread.start()
     thread.join()
 
     if result_data.get("success"):
-        logger.info(f"Video approved: {result_data['perm_key']}")
+        logger.info("Video approved")
         return {
             "status": "success",
-            "perm_key": result_data["perm_key"],
             "video_url": result_data["video_url"],
         }
     else:
@@ -220,15 +218,15 @@ def confirm_upload(req: ConfirmUploadRequest):
         raise HTTPException(status_code=400, detail="Video failed moderation")
 
 # -------------------------
-# List S3 files endpoints
+# List S3 files endpoints (safe presigned URLs)
 # -------------------------
 @app.get("/list-temp-files")
 def list_temp_files() -> List[str]:
     try:
         response = s3_client.list_objects_v2(Bucket=TEMP_BUCKET)
-        files = [obj["Key"] for obj in response.get("Contents", [])]
-        logger.info(f"Temp bucket files: {files}")
-        return files
+        files = response.get("Contents", [])
+        urls = [generate_presigned_get(TEMP_BUCKET, obj["Key"]) for obj in files]
+        return [url for url in urls if url is not None]
     except Exception as e:
         logger.error(f"Error listing temp files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -237,9 +235,9 @@ def list_temp_files() -> List[str]:
 def list_perm_files() -> List[str]:
     try:
         response = s3_client.list_objects_v2(Bucket=PERM_BUCKET)
-        files = [obj["Key"] for obj in response.get("Contents", [])]
-        logger.info(f"Permanent bucket files: {files}")
-        return files
+        files = response.get("Contents", [])
+        urls = [generate_presigned_get(PERM_BUCKET, obj["Key"]) for obj in files]
+        return [url for url in urls if url is not None]
     except Exception as e:
         logger.error(f"Error listing permanent files: {e}")
         raise HTTPException(status_code=500, detail=str(e))

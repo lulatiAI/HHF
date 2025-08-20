@@ -93,7 +93,6 @@ def generate_presigned_get(bucket: str, key: str, expires: int = 3600) -> Option
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires,
         )
-        logger.info(f"Generated presigned GET URL for {key}")
         return url
     except Exception as e:
         logger.error(f"Error generating presigned GET URL: {e}")
@@ -102,7 +101,6 @@ def generate_presigned_get(bucket: str, key: str, expires: int = 3600) -> Option
 def approve_and_move(temp_key: str, filename: str, metadata: Dict[str, str]):
     try:
         perm_key = f"{uuid.uuid4()}_{filename}"
-        logger.info(f"Moving {temp_key} to permanent bucket as {perm_key}")
         s3_client.copy_object(
             Bucket=PERM_BUCKET,
             Key=perm_key,
@@ -112,7 +110,6 @@ def approve_and_move(temp_key: str, filename: str, metadata: Dict[str, str]):
         )
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
         presigned_url = generate_presigned_get(PERM_BUCKET, perm_key)
-        logger.info(f"Move successful: {perm_key}")
         return perm_key, presigned_url
     except Exception as e:
         logger.error(f"Error moving file: {e}")
@@ -123,20 +120,16 @@ def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callba
         approved = False
         presigned_url = None
 
-        logger.info(f"Starting moderation for {filename}")
-
         if is_video(filename):
             response = rekognition.start_content_moderation(
                 Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
                 MinConfidence=90,
             )
             job_id = response["JobId"]
-            logger.info(f"Moderation job started: {job_id}")
             while True:
                 result = rekognition.get_content_moderation(JobId=job_id)
                 if result.get("JobStatus") in ["SUCCEEDED", "FAILED"]:
                     break
-                logger.info("Waiting for moderation result...")
                 time.sleep(5)
             labels = result.get("ModerationLabels", [])
             if not labels:
@@ -153,22 +146,20 @@ def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callba
 
         if approved:
             perm_key, presigned_url = approve_and_move(temp_key, filename, metadata)
-            callback(success=True, perm_key=perm_key, presigned_url=presigned_url)
+            callback(success=True, video_url=presigned_url)
         else:
-            logger.info(f"{filename} failed moderation, deleting from temp bucket")
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
-            callback(success=False, perm_key=None, presigned_url=None)
+            callback(success=False, video_url=None)
     except Exception as e:
         logger.error(f"Moderation error: {e}")
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
-        callback(success=False, perm_key=None, presigned_url=None)
+        callback(success=False, video_url=None)
 
 # -------------------------
 # Endpoints
 # -------------------------
 @app.get("/test")
 def test():
-    logger.info("Test endpoint called")
     return {"status": "ok", "message": "Server is live"}
 
 @app.post("/get-upload-url")
@@ -183,11 +174,11 @@ def get_upload_url(req: UploadRequest):
             Params={"Bucket": TEMP_BUCKET, "Key": temp_key, "ContentType": content_type},
             ExpiresIn=3600,
         )
-        logger.info(f"Generated presigned upload URL for {req.filename}")
-        # Return only the presigned URL and headers
+        # Return presigned URL **and temp_key** so frontend can pass it to confirm-upload
         return {
             "status": "success",
             "upload_url": presigned_url,
+            "temp_key": temp_key,
             "required_headers": {"Content-Type": content_type},
         }
     except Exception as e:
@@ -199,22 +190,17 @@ def confirm_upload(req: ConfirmUploadRequest):
     metadata = {"email": req.email, "videoType": req.videoType, "comments": req.comments}
     result_data = {}
 
-    def callback(success, perm_key, presigned_url):
+    def callback(success, video_url):
         result_data["success"] = success
-        result_data["video_url"] = presigned_url  # Only URL, no S3 key
+        result_data["video_url"] = video_url
 
     thread = threading.Thread(target=moderate_video, args=(req.temp_key, req.filename, metadata, callback))
     thread.start()
     thread.join()
 
     if result_data.get("success"):
-        logger.info("Video approved")
-        return {
-            "status": "success",
-            "video_url": result_data["video_url"],
-        }
+        return {"status": "success", "video_url": result_data["video_url"]}
     else:
-        logger.info("Video failed moderation")
         raise HTTPException(status_code=400, detail="Video failed moderation")
 
 # -------------------------
@@ -225,10 +211,8 @@ def list_temp_files() -> List[str]:
     try:
         response = s3_client.list_objects_v2(Bucket=TEMP_BUCKET)
         files = response.get("Contents", [])
-        urls = [generate_presigned_get(TEMP_BUCKET, obj["Key"]) for obj in files]
-        return [url for url in urls if url is not None]
+        return [generate_presigned_get(TEMP_BUCKET, obj["Key"]) for obj in files if obj]
     except Exception as e:
-        logger.error(f"Error listing temp files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/list-perm-files")
@@ -236,8 +220,6 @@ def list_perm_files() -> List[str]:
     try:
         response = s3_client.list_objects_v2(Bucket=PERM_BUCKET)
         files = response.get("Contents", [])
-        urls = [generate_presigned_get(PERM_BUCKET, obj["Key"]) for obj in files]
-        return [url for url in urls if url is not None]
+        return [generate_presigned_get(PERM_BUCKET, obj["Key"]) for obj in files if obj]
     except Exception as e:
-        logger.error(f"Error listing permanent files: {e}")
         raise HTTPException(status_code=500, detail=str(e))

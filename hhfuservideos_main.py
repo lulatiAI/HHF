@@ -8,6 +8,7 @@ import mimetypes
 import threading
 import time
 import os
+import subprocess
 import logging
 from typing import Optional, Dict, List
 
@@ -65,6 +66,7 @@ class UploadRequest(BaseModel):
     email: str
     videoType: str
     consent: Optional[bool] = True
+    comments: Optional[str] = ""
 
 class ConfirmUploadRequest(BaseModel):
     temp_key: str
@@ -76,6 +78,13 @@ class ConfirmUploadRequest(BaseModel):
 # -------------------------
 # Helpers
 # -------------------------
+def check_ffmpeg():
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        return True
+    except Exception:
+        return False
+
 def guess_content_type(filename: str) -> str:
     ctype, _ = mimetypes.guess_type(filename)
     return ctype or "application/octet-stream"
@@ -98,21 +107,46 @@ def generate_presigned_get(bucket: str, key: str, expires: int = 3600) -> Option
         logger.error(f"Error generating presigned GET URL: {e}")
         return None
 
+def reencode_video(local_path: str, output_path: str):
+    """Re-encode video to MP4 H.264 + AAC for broad compatibility"""
+    try:
+        cmd = [
+            "ffmpeg",
+            "-i", local_path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-movflags", "+faststart",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            output_path,
+            "-y"
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        return True
+    except Exception as e:
+        logger.error(f"FFmpeg re-encode failed: {e}")
+        return False
+
 def approve_and_move(temp_key: str, filename: str, metadata: Dict[str, str]):
     try:
-        perm_key = f"{uuid.uuid4()}_{filename}"
-        s3_client.copy_object(
-            Bucket=PERM_BUCKET,
-            Key=perm_key,
-            CopySource={"Bucket": TEMP_BUCKET, "Key": temp_key},
-            Metadata=metadata,
-            MetadataDirective="REPLACE",
-        )
+        # Download temp video
+        local_temp = f"/tmp/{uuid.uuid4()}_{filename}"
+        s3_client.download_file(TEMP_BUCKET, temp_key, local_temp)
+
+        # Re-encode to mp4
+        new_filename = pathlib.Path(filename).stem + ".mp4"
+        local_out = f"/tmp/{uuid.uuid4()}_{new_filename}"
+        reencode_video(local_temp, local_out)
+
+        # Upload to permanent bucket
+        perm_key = f"{uuid.uuid4()}_{new_filename}"
+        s3_client.upload_file(local_out, PERM_BUCKET, perm_key, ExtraArgs={"Metadata": metadata, "ContentType":"video/mp4"})
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+
         presigned_url = generate_presigned_get(PERM_BUCKET, perm_key)
         return perm_key, presigned_url
     except Exception as e:
-        logger.error(f"Error moving file: {e}")
+        logger.error(f"Error moving/re-encoding file: {e}")
         return None, None
 
 def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callback):
@@ -160,7 +194,8 @@ def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callba
 # -------------------------
 @app.get("/test")
 def test():
-    return {"status": "ok", "message": "Server is live"}
+    ffmpeg_status = check_ffmpeg()
+    return {"status": "ok", "message": "Server live", "ffmpeg_installed": ffmpeg_status}
 
 @app.post("/get-upload-url")
 def get_upload_url(req: UploadRequest):
@@ -174,7 +209,6 @@ def get_upload_url(req: UploadRequest):
             Params={"Bucket": TEMP_BUCKET, "Key": temp_key, "ContentType": content_type},
             ExpiresIn=3600,
         )
-        # Return presigned URL **and temp_key** so frontend can pass it to confirm-upload
         return {
             "status": "success",
             "upload_url": presigned_url,
@@ -203,9 +237,6 @@ def confirm_upload(req: ConfirmUploadRequest):
     else:
         raise HTTPException(status_code=400, detail="Video failed moderation")
 
-# -------------------------
-# List S3 files endpoints (safe presigned URLs)
-# -------------------------
 @app.get("/list-temp-files")
 def list_temp_files() -> List[str]:
     try:

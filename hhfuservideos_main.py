@@ -59,14 +59,25 @@ app.add_middleware(
 )
 
 # -------------------------
-# Request logging middleware
+# Request logging middleware (shows up in Render logs)
 # -------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logger.info(f"➡️ {request.method} {request.url}")
-    response = await call_next(request)
-    logger.info(f"⬅️ {request.method} {request.url} - {response.status_code}")
-    return response
+    try:
+        response = await call_next(request)
+        logger.info(f"⬅️ {request.method} {request.url} - {response.status_code}")
+        return response
+    except Exception as e:
+        logger.exception(f"🔥 Unhandled error for {request.method} {request.url}: {e}")
+        raise
+
+# -------------------------
+# Root route (fixes 404 at '/')
+# -------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "FastAPI is running 🚀"}
 
 # -------------------------
 # Pydantic models
@@ -88,11 +99,12 @@ class ConfirmUploadRequest(BaseModel):
 # -------------------------
 # Helpers
 # -------------------------
-def check_ffmpeg():
+def check_ffmpeg() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"FFmpeg check failed (likely not installed): {e}")
         return False
 
 def guess_content_type(filename: str) -> str:
@@ -117,8 +129,11 @@ def generate_presigned_get(bucket: str, key: str, expires: int = 3600) -> Option
         logger.error(f"Error generating presigned GET URL: {e}")
         return None
 
-def reencode_video(local_path: str, output_path: str):
+def reencode_video(local_path: str, output_path: str) -> bool:
     """Re-encode video to MP4 H.264 + AAC for broad compatibility"""
+    if not check_ffmpeg():
+        logger.error("FFmpeg is not installed on the server. Re-encode will be skipped and fail.")
+        return False
     try:
         cmd = [
             "ffmpeg",
@@ -131,40 +146,55 @@ def reencode_video(local_path: str, output_path: str):
             output_path,
             "-y"
         ]
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        logger.info(f"FFmpeg re-encode complete: {output_path}")
         return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg re-encode failed (returncode {e.returncode}): {e.stderr.decode(errors='ignore')[:600]}")
+        return False
     except Exception as e:
-        logger.error(f"FFmpeg re-encode failed: {e}")
+        logger.exception(f"FFmpeg re-encode unexpected error: {e}")
         return False
 
 def approve_and_move(temp_key: str, filename: str, metadata: Dict[str, str]):
     try:
         # Download temp video
         local_temp = f"/tmp/{uuid.uuid4()}_{filename}"
+        logger.info(f"Downloading from s3://{TEMP_BUCKET}/{temp_key} -> {local_temp}")
         s3_client.download_file(TEMP_BUCKET, temp_key, local_temp)
 
         # Re-encode to mp4
         new_filename = pathlib.Path(filename).stem + ".mp4"
         local_out = f"/tmp/{uuid.uuid4()}_{new_filename}"
-        reencode_video(local_temp, local_out)
+        ok = reencode_video(local_temp, local_out)
+        if not ok:
+            logger.error("Re-encode failed; aborting move to permanent bucket.")
+            return None, None
 
         # Upload to permanent bucket
         perm_key = f"{uuid.uuid4()}_{new_filename}"
-        s3_client.upload_file(local_out, PERM_BUCKET, perm_key, ExtraArgs={"Metadata": metadata, "ContentType":"video/mp4"})
+        logger.info(f"Uploading to s3://{PERM_BUCKET}/{perm_key}")
+        s3_client.upload_file(
+            local_out,
+            PERM_BUCKET,
+            perm_key,
+            ExtraArgs={"Metadata": metadata, "ContentType": "video/mp4"},
+        )
+        # Clean up temp
         s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
 
         presigned_url = generate_presigned_get(PERM_BUCKET, perm_key)
         return perm_key, presigned_url
     except Exception as e:
-        logger.error(f"Error moving/re-encoding file: {e}")
+        logger.exception(f"Error moving/re-encoding file: {e}")
         return None, None
 
-def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callback):
+def moderate_video(temp_key: str, filename: str, metadata: Dict[str, str], callback):
     try:
         approved = False
-        presigned_url = None
 
         if is_video(filename):
+            logger.info(f"Starting Rekognition content moderation (video) for key: {temp_key}")
             response = rekognition.start_content_moderation(
                 Video={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
                 MinConfidence=90,
@@ -172,31 +202,37 @@ def moderate_video(temp_key: str, filename: str, metadata: Dict[str,str], callba
             job_id = response["JobId"]
             while True:
                 result = rekognition.get_content_moderation(JobId=job_id)
-                if result.get("JobStatus") in ["SUCCEEDED", "FAILED"]:
+                status = result.get("JobStatus")
+                if status in ["SUCCEEDED", "FAILED"]:
+                    logger.info(f"Rekognition job {job_id} finished with status: {status}")
                     break
                 time.sleep(5)
             labels = result.get("ModerationLabels", [])
-            if not labels:
-                approved = True
+            approved = not labels  # approve if no labels
         elif is_image(filename):
+            logger.info(f"Running Rekognition detect_moderation_labels (image) for key: {temp_key}")
             result = rekognition.detect_moderation_labels(
                 Image={"S3Object": {"Bucket": TEMP_BUCKET, "Name": temp_key}},
                 MinConfidence=90,
             )
-            if not result.get("ModerationLabels"):
-                approved = True
+            approved = not result.get("ModerationLabels")
         else:
+            logger.info("Non-video/image file; auto-approving.")
             approved = True
 
         if approved:
             perm_key, presigned_url = approve_and_move(temp_key, filename, metadata)
-            callback(success=True, video_url=presigned_url)
+            callback(success=bool(perm_key and presigned_url), video_url=presigned_url)
         else:
+            logger.info("Content rejected by moderation; deleting temp object.")
             s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
             callback(success=False, video_url=None)
     except Exception as e:
-        logger.error(f"Moderation error: {e}")
-        s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+        logger.exception(f"Moderation error: {e}")
+        try:
+            s3_client.delete_object(Bucket=TEMP_BUCKET, Key=temp_key)
+        except Exception:
+            pass
         callback(success=False, video_url=None)
 
 # -------------------------
@@ -214,6 +250,7 @@ def get_upload_url(req: UploadRequest):
     temp_key = f"{uuid.uuid4()}_{req.filename}"
     content_type = guess_content_type(req.filename)
     try:
+        logger.info(f"Generating presigned PUT for {temp_key} (Content-Type: {content_type})")
         presigned_url = s3_client.generate_presigned_url(
             "put_object",
             Params={"Bucket": TEMP_BUCKET, "Key": temp_key, "ContentType": content_type},
@@ -226,18 +263,19 @@ def get_upload_url(req: UploadRequest):
             "required_headers": {"Content-Type": content_type},
         }
     except Exception as e:
-        logger.error(f"Error generating upload URL: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error generating upload URL")
+        raise HTTPException(status_code=500, detail="Failed to generate upload URL")
 
 @app.post("/confirm-upload")
 def confirm_upload(req: ConfirmUploadRequest):
     metadata = {"email": req.email, "videoType": req.videoType, "comments": req.comments}
-    result_data = {}
+    result_data: Dict[str, Optional[str]] = {}
 
-    def callback(success, video_url):
+    def callback(success: bool, video_url: Optional[str]):
         result_data["success"] = success
         result_data["video_url"] = video_url
 
+    logger.info(f"Confirming upload temp_key={req.temp_key} filename={req.filename}")
     thread = threading.Thread(target=moderate_video, args=(req.temp_key, req.filename, metadata, callback))
     thread.start()
     thread.join()
@@ -245,7 +283,7 @@ def confirm_upload(req: ConfirmUploadRequest):
     if result_data.get("success"):
         return {"status": "success", "video_url": result_data["video_url"]}
     else:
-        raise HTTPException(status_code=400, detail="Video failed moderation")
+        raise HTTPException(status_code=400, detail="Video failed moderation or processing")
 
 @app.get("/list-temp-files")
 def list_temp_files() -> List[str]:
@@ -254,7 +292,8 @@ def list_temp_files() -> List[str]:
         files = response.get("Contents", [])
         return [generate_presigned_get(TEMP_BUCKET, obj["Key"]) for obj in files if obj]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error listing temp files")
+        raise HTTPException(status_code=500, detail="Failed to list temp files")
 
 @app.get("/list-perm-files")
 def list_perm_files() -> List[str]:
@@ -263,4 +302,5 @@ def list_perm_files() -> List[str]:
         files = response.get("Contents", [])
         return [generate_presigned_get(PERM_BUCKET, obj["Key"]) for obj in files if obj]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error listing perm files")
+        raise HTTPException(status_code=500, detail="Failed to list perm files")

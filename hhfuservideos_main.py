@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import boto3
@@ -57,6 +57,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------
+# Request logging middleware
+# -------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"➡️ {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"⬅️ {request.method} {request.url} - {response.status_code}")
+    return response
 
 # -------------------------
 # Pydantic models
